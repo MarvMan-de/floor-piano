@@ -1,4 +1,7 @@
-opencv-contrib-python>=4.7
+opencv-contrib-python>=4.7   # MUST be the "contrib" build — we use cv2.aruco.
+                             # NOT opencv-python and NOT apt python3-opencv (no aruco).
+                             # conda users: the conda-forge package "py-opencv" also works.
+                             # Verify: python3 -c "import cv2; print(cv2.__version__, hasattr(cv2,'aruco'))"  -> must be True
 pygame
 numpy
 
