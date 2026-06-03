@@ -1,5 +1,4 @@
 opencv-contrib-python
 pygame
 numpy
-openni
-hailo-sdk-python
+pyorbbecsdk

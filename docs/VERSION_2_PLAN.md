@@ -32,10 +32,12 @@ Eliminate the need for a keyboard, mouse, and monitor.
 *   **90 FPS Target**: Maintain a rock-solid 90 FPS for near-zero latency (under 10ms), matching the response time of a high-end digital piano.
 
 ## 📝 Implementation Roadmap (Next Steps)
-1.  **[ ] Phase 1: ArUco Integration**: Modify `calibrate.py` to include an `auto_detect_corners()` function using `cv2.aruco`.
-2.  **[ ] Phase 2: 3D Plane Fitting**: Implement the RANSAC plane fitting logic in `detector.py`.
-3.  **[ ] Phase 3: Headless Service**: Create the `systemd` service and Python GPIO scripts for LED/Button control.
-4.  **[ ] Phase 4: Enclosure Design**: Design a 3D-printable box to house the Pi 5, Hailo Kit, and Astra Pro as a single unit.
+1.  **[x] Phase 1: ArUco Integration**: `calibrate.py` auto-detects corners via `cv2.aruco`. Config saved to script dir (not CWD).
+2.  **[x] Phase 1b: SDK Migration**: Replaced dead `openni`/OpenNI2 bindings with official `pyorbbecsdk` (OrbbecSDK). Fixed all CWD-relative path bugs.
+3.  **[ ] Phase 2: 3D Plane Fitting**: Implement RANSAC plane fitting in place of current median floor sampling.
+4.  **[ ] Phase 3: Hailo-8L Pose Integration**: Wire foot detection model into Hailo NPU for multi-person support and sub-pixel accuracy.
+5.  **[ ] Phase 4: Headless Service**: Create `systemd` service and Python GPIO scripts for LED/Button control.
+6.  **[ ] Phase 5: Enclosure Design**: Design a 3D-printable box to house the Pi 5, Hailo Kit, and Astra Pro as a single unit.
 
 ---
 *Created on 2026-04-10 | Status: Drafting / Research Phase*

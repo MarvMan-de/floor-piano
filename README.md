@@ -6,7 +6,7 @@ Professional-grade interactive floor piano system optimized for Raspberry Pi 5 +
 
 - **3D Depth Triggering**: Ultra-low latency (<10ms) using Orbbec Astra Pro depth sensing
 - **Headless Operation**: Autonomous calibration with ArUco markers - no monitor required
-- **Hailo-8L AI Acceleration**: 90 FPS pose estimation and depth processing
+- **Hailo-8L AI Acceleration**: Hardware NPU present — pose estimation integration in progress
 - **Professional Audio**: Low-latency PyGame audio engine with high-quality samples
 - **Auto-Leveling**: Dynamic floor plane detection with RANSAC algorithm
 
@@ -62,10 +62,10 @@ floor-piano/
 ## 🔧 Development Status
 
 **Version 2.0** - Professional Headless Edition
-- ✅ 3D Depth Triggering
+- ✅ 3D Depth Triggering (pyorbbecsdk)
 - ✅ ArUco Marker Calibration
 - ✅ Low-Latency Audio Engine
-- 🚧 Hailo-8L Integration
+- 🚧 Hailo-8L Pose Integration
 - 🚧 Systemd Service
 - 🚧 GPIO Status Indicators
 

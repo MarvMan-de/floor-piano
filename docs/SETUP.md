@@ -15,7 +15,7 @@ This system is specifically optimized for the **Raspberry Pi 5 + Orbbec Astra Pr
 ### 1. System-Level Dependencies
 ```bash
 sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y python3-pip libopencv-dev libatlas-base-dev libportaudio2 libopenni2-dev ffmpeg
+sudo apt install -y python3-pip libopencv-dev libatlas-base-dev libportaudio2 ffmpeg libusb-1.0-0-dev
 ```
 
 ### 2. Hailo-8L NPU Setup

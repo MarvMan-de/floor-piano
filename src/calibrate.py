@@ -3,131 +3,134 @@ import json
 import numpy as np
 import os
 import sys
-import time
 
-# Try to import OpenNI2 for Orbbec Astra
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 try:
-    from openni import openni2
-    HAS_OPENNI = True
+    from pyorbbecsdk import Pipeline, Config, OBSensorType
 except ImportError:
-    HAS_OPENNI = False
-    print("Error: openni library not found. Install it with 'pip install openni'.")
+    print("Fatal Error: 'pyorbbecsdk' not found. Install with 'pip install pyorbbecsdk'.")
+    sys.exit(1)
 
 def main():
-    if not HAS_OPENNI:
-        print("Hardware required: Orbbec Astra (OpenNI2).")
-        sys.exit(1)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_output = os.path.join(script_dir, "config.json")
 
-    # Initialize Astra
+    # Orbbec: depth via pyorbbecsdk
     try:
-        openni2.initialize()
-        dev = openni2.Device.open_any()
-        depth_stream = dev.create_depth_stream()
-        depth_stream.start()
+        pipeline = Pipeline()
+        orbbec_config = Config()
+        profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+        depth_profile = profile_list.get_default_video_stream_profile()
+        orbbec_config.enable_stream(depth_profile)
+        pipeline.start(orbbec_config)
         print("Orbbec Astra Depth Stream Started.")
     except Exception as e:
-        print(f"Error initializing Astra: {e}")
+        print(f"Error initializing Orbbec: {e}")
         sys.exit(1)
 
-    # Initialize RGB Stream (Standard UVC)
-    cap = cv2.VideoCapture(0) # Astra Pro RGB is usually the first camera
-    if not cap.isOpened():
-        print("Error: Could not open Astra RGB camera.")
-        # We can still proceed with depth only if needed, but ArUco needs RGB
-        # Let's try to find the right index if 0 fails
-        for i in range(1, 5):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                print(f"Astra RGB found on index {i}")
-                break
-        else:
-            print("Astra RGB camera not found.")
-            sys.exit(1)
+    # Astra Pro RGB is a standard UVC camera — find it via OpenCV
+    cap = None
+    for i in range(5):
+        candidate = cv2.VideoCapture(i)
+        if candidate.isOpened():
+            cap = candidate
+            print(f"Astra RGB found on index {i}")
+            break
+    if cap is None:
+        print("Error: Astra RGB camera not found.")
+        pipeline.stop()
+        sys.exit(1)
 
-    # ArUco Setup
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     parameters = cv2.aruco.DetectorParameters()
     detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
 
-    print("\n--- 🎹 AUTOMATIC PIANO CALIBRATION ---")
+    print("\n--- PIANO CALIBRATION ---")
     print("1. Place ArUco markers (ID 0-3) at the 4 corners of the mat.")
-    print("2. The system will automatically detect the corners and sample depth.")
-    print("Press 's' to save and exit, 'q' to quit.")
+    print("   Order: 0=Top-Left, 1=Top-Right, 2=Bottom-Right, 3=Bottom-Left")
+    print("2. System auto-detects corners and samples floor depth.")
+    print("Press 's' to save, 'q' to quit.")
 
     corners_found = None
     floor_depth = 1000
 
     try:
         while True:
-            # 1. Read RGB Frame
             ret, rgb_frame = cap.read()
             if not ret:
-                break
+                continue
 
-            # 2. Read Depth Frame
-            d_frame = depth_stream.read_frame()
-            d_frame_data = d_frame.get_buffer_as_uint16()
-            depth_array = np.ndarray((d_frame.height, d_frame.width), dtype=np.uint16, buffer=d_frame_data)
+            frames = pipeline.wait_for_frames(100)
+            depth_frame = frames.get_depth_frame() if frames else None
+            if depth_frame is None:
+                continue
 
-            # 3. Detect ArUco
-            corners, ids, rejected = detector.detectMarkers(rgb_frame)
-            
+            dh = depth_frame.get_height()
+            dw = depth_frame.get_width()
+            depth_array = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape((dh, dw))
+
+            corners, ids, _ = detector.detectMarkers(rgb_frame)
+
             if ids is not None and len(ids) >= 4:
-                # We need IDs 0, 1, 2, 3
                 corner_pts = {}
                 for i in range(len(ids)):
-                    corner_pts[ids[i][0]] = np.mean(corners[i][0], axis=0)
-                
-                if all(id in corner_pts for id in [0, 1, 2, 3]):
-                    # Found all 4 corners
-                    # Order: 0:TL, 1:TR, 2:BR, 3:BL
+                    marker_id = ids[i][0]
+                    if marker_id in [0, 1, 2, 3]:
+                        corner_pts[marker_id] = np.mean(corners[i][0], axis=0)
+
+                if all(mid in corner_pts for mid in [0, 1, 2, 3]):
                     pts = np.float32([corner_pts[0], corner_pts[1], corner_pts[2], corner_pts[3]])
                     corners_found = pts.tolist()
-                    
-                    # Draw for debug
+
                     for i, pt in enumerate(pts):
                         cv2.circle(rgb_frame, tuple(pt.astype(int)), 10, (0, 255, 0), -1)
-                        cv2.putText(rgb_frame, f"ID {i}", tuple(pt.astype(int)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                    
-                    # 4. Sample Depth in the middle of the mat
-                    # Simple median of the center area of the detected mat
-                    # Warp for depth is tricky if RGB and Depth aren't aligned perfectly
-                    # For Astra Pro, they are separate. We use the RGB corners.
-                    
-                    # Just sample a few points around the center for now
+                        cv2.putText(rgb_frame, f"ID {i}", tuple(pt.astype(int)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                    # Scale RGB coordinates to depth resolution for sampling
+                    rh, rw = rgb_frame.shape[:2]
                     center_x = int(np.mean(pts[:, 0]))
                     center_y = int(np.mean(pts[:, 1]))
-                    
-                    if 0 <= center_x < depth_array.shape[1] and 0 <= center_y < depth_array.shape[0]:
-                        sample_depth = depth_array[center_y-10:center_y+10, center_x-10:center_x+10]
-                        median_depth = np.median(sample_depth[sample_depth > 0])
-                        if not np.isnan(median_depth):
-                            floor_depth = int(median_depth)
-                            cv2.putText(rgb_frame, f"Floor Depth: {floor_depth}mm", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    dx = int(center_x * dw / rw)
+                    dy = int(center_y * dh / rh)
 
-            cv2.imshow("Calibration (RGB)", rgb_frame)
-            
+                    if 10 <= dy < dh - 10 and 10 <= dx < dw - 10:
+                        sample = depth_array[dy-10:dy+10, dx-10:dx+10]
+                        valid = sample[sample > 0]
+                        if len(valid) > 0:
+                            floor_depth = int(np.median(valid))
+                            cv2.putText(rgb_frame, f"Floor Depth: {floor_depth}mm", (20, 50),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                    cv2.putText(rgb_frame, "Press 's' to save", (20, 80),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(rgb_frame, "Searching for ArUco markers (IDs 0-3)...", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+            cv2.imshow("Calibration", rgb_frame)
+
             key = cv2.waitKey(1) & 0xFF
             if key == ord('s') and corners_found:
-                # Save to config.json
-                config = {
+                rh, rw = rgb_frame.shape[:2]
+                config_data = {
                     "corners": corners_found,
                     "keys": ["C", "D", "E", "F", "G", "A", "B"],
                     "floor_depth": floor_depth,
-                    "trigger_threshold": 50, # 5cm above floor
-                    "canvas_size": [rgb_frame.shape[1], rgb_frame.shape[0]]
+                    "trigger_threshold": 50,
+                    "canvas_size": [rw, rh]
                 }
-                with open("config.json", "w") as f:
-                    json.dump(config, f, indent=4)
-                print(f"Calibration saved to config.json! Floor depth set to {floor_depth}mm.")
+                with open(config_output, "w") as f:
+                    json.dump(config_data, f, indent=4)
+                print(f"Calibration saved to {config_output}. Floor depth: {floor_depth}mm.")
                 break
             elif key == ord('q'):
                 break
 
     finally:
         cap.release()
-        depth_stream.stop()
-        openni2.unload()
+        pipeline.stop()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
