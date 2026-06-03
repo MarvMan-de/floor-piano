@@ -1,137 +1,154 @@
-import cv2
 import json
-import numpy as np
+import logging
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cv2
+import numpy as np
 
-try:
-    from pyorbbecsdk import Pipeline, Config, OBSensorType
-except ImportError:
-    print("Fatal Error: 'pyorbbecsdk' not found. Install with 'pip install pyorbbecsdk'.")
-    sys.exit(1)
+# Resolve sibling imports regardless of the working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import constants
+from depth_camera import DepthCamera, DepthCameraError
+from detection import build_config, sample_floor_depth
+
+log = logging.getLogger("calibrate")
+
+# Consecutive good detections required before auto-saving in headless mode.
+HEADLESS_STABLE_FRAMES = 15
+
+
+def find_rgb_camera(max_index=5):
+    """Return an opened cv2.VideoCapture for the Astra's UVC RGB stream, or None.
+
+    The Pi exposes several /dev/video* nodes (RGB, IR, metadata). We validate each
+    candidate with an actual 3-channel colour frame instead of trusting isOpened().
+    Set FLOOR_PIANO_RGB_INDEX to force a specific index if auto-detection misfires.
+    """
+    override = os.environ.get("FLOOR_PIANO_RGB_INDEX")
+    indices = [int(override)] if override else range(max_index)
+    for i in indices:
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
+                log.info("Using RGB camera at index %d (%dx%d).", i, frame.shape[1], frame.shape[0])
+                return cap
+        cap.release()  # not a usable colour camera; don't leak the handle
+    return None
+
+
+def detect_corners(detector, rgb_frame):
+    """Return {id: (x, y) marker centre} for all 4 corner markers, else None.
+
+    The marker *centre* is used as the corner reference. This insets the playable
+    area by ~half a marker uniformly on all sides (fine for play); see SETUP.md.
+    """
+    corners, ids, _ = detector.detectMarkers(rgb_frame)
+    if ids is None or len(ids) < 4:
+        return None
+    found = {}
+    for i in range(len(ids)):
+        mid = int(ids[i][0])
+        if mid in constants.CORNER_IDS:
+            found[mid] = np.mean(corners[i][0], axis=0)
+    if all(mid in found for mid in constants.CORNER_IDS):
+        return found
+    return None
+
+
+def save_config(config_data, path):
+    with open(path, "w") as f:
+        json.dump(config_data, f, indent=4)
+    log.info("Calibration saved to %s (floor_depth=%dmm).", path, config_data["floor_depth"])
+
+
+def _annotate(rgb, found, floor_depth):
+    for mid in constants.CORNER_IDS:
+        pt = tuple(found[mid].astype(int))
+        cv2.circle(rgb, pt, 10, (0, 255, 0), -1)
+        cv2.putText(rgb, f"ID {mid}", pt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(rgb, f"Floor: {floor_depth}mm  -  press 's' to save",
+                (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
 
 def main():
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_output = os.path.join(script_dir, "config.json")
+    headless = not os.environ.get('DISPLAY')  # unset OR empty -> headless
 
-    # Orbbec: depth via pyorbbecsdk
+    camera = DepthCamera()
     try:
-        pipeline = Pipeline()
-        orbbec_config = Config()
-        profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        depth_profile = profile_list.get_default_video_stream_profile()
-        orbbec_config.enable_stream(depth_profile)
-        pipeline.start(orbbec_config)
-        print("Orbbec Astra Depth Stream Started.")
-    except Exception as e:
-        print(f"Error initializing Orbbec: {e}")
+        camera.start()
+    except DepthCameraError as e:
+        log.error("%s", e)
         sys.exit(1)
 
-    # Astra Pro RGB is a standard UVC camera — find it via OpenCV
-    cap = None
-    for i in range(5):
-        candidate = cv2.VideoCapture(i)
-        if candidate.isOpened():
-            cap = candidate
-            print(f"Astra RGB found on index {i}")
-            break
+    cap = find_rgb_camera()
     if cap is None:
-        print("Error: Astra RGB camera not found.")
-        pipeline.stop()
+        log.error("Astra RGB camera not found.")
+        camera.stop()
         sys.exit(1)
 
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    parameters = cv2.aruco.DetectorParameters()
-    detector = cv2.aruco.ArucoDetector(aruco_dict, parameters)
+    detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
 
-    print("\n--- PIANO CALIBRATION ---")
-    print("1. Place ArUco markers (ID 0-3) at the 4 corners of the mat.")
-    print("   Order: 0=Top-Left, 1=Top-Right, 2=Bottom-Right, 3=Bottom-Left")
-    print("2. System auto-detects corners and samples floor depth.")
-    print("Press 's' to save, 'q' to quit.")
+    log.info("--- PIANO CALIBRATION (%s mode) ---", "headless" if headless else "GUI")
+    log.info("Place ArUco markers IDs 0-3 at the mat corners (0=TL, 1=TR, 2=BR, 3=BL).")
+    if headless:
+        log.info("Headless: auto-saving once markers stay detected for %d frames.",
+                 HEADLESS_STABLE_FRAMES)
+    else:
+        log.info("Press 's' to save, 'q' to quit.")
 
-    corners_found = None
-    floor_depth = 1000
-
+    stable = 0
     try:
         while True:
-            ret, rgb_frame = cap.read()
+            ret, rgb = cap.read()
             if not ret:
                 continue
-
-            frames = pipeline.wait_for_frames(100)
-            depth_frame = frames.get_depth_frame() if frames else None
-            if depth_frame is None:
+            depth = camera.read_depth()
+            if depth is None:
                 continue
 
-            dh = depth_frame.get_height()
-            dw = depth_frame.get_width()
-            depth_array = np.frombuffer(depth_frame.get_data(), dtype=np.uint16).reshape((dh, dw))
-
-            corners, ids, _ = detector.detectMarkers(rgb_frame)
-
-            if ids is not None and len(ids) >= 4:
-                corner_pts = {}
-                for i in range(len(ids)):
-                    marker_id = ids[i][0]
-                    if marker_id in [0, 1, 2, 3]:
-                        corner_pts[marker_id] = np.mean(corners[i][0], axis=0)
-
-                if all(mid in corner_pts for mid in [0, 1, 2, 3]):
-                    pts = np.float32([corner_pts[0], corner_pts[1], corner_pts[2], corner_pts[3]])
-                    corners_found = pts.tolist()
-
-                    for i, pt in enumerate(pts):
-                        cv2.circle(rgb_frame, tuple(pt.astype(int)), 10, (0, 255, 0), -1)
-                        cv2.putText(rgb_frame, f"ID {i}", tuple(pt.astype(int)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                    # Scale RGB coordinates to depth resolution for sampling
-                    rh, rw = rgb_frame.shape[:2]
-                    center_x = int(np.mean(pts[:, 0]))
-                    center_y = int(np.mean(pts[:, 1]))
-                    dx = int(center_x * dw / rw)
-                    dy = int(center_y * dh / rh)
-
-                    if 10 <= dy < dh - 10 and 10 <= dx < dw - 10:
-                        sample = depth_array[dy-10:dy+10, dx-10:dx+10]
-                        valid = sample[sample > 0]
-                        if len(valid) > 0:
-                            floor_depth = int(np.median(valid))
-                            cv2.putText(rgb_frame, f"Floor Depth: {floor_depth}mm", (20, 50),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-                    cv2.putText(rgb_frame, "Press 's' to save", (20, 80),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            found = detect_corners(detector, rgb)
+            config_data = None
+            if found is not None:
+                center = (float(np.mean([found[m][0] for m in constants.CORNER_IDS])),
+                          float(np.mean([found[m][1] for m in constants.CORNER_IDS])))
+                floor_depth = sample_floor_depth(depth, center, rgb.shape)
+                config_data = build_config(found, floor_depth, rgb.shape)
+                stable += 1
+                if not headless:
+                    _annotate(rgb, found, floor_depth)
             else:
-                cv2.putText(rgb_frame, "Searching for ArUco markers (IDs 0-3)...", (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+                stable = 0
+                if not headless:
+                    cv2.putText(rgb, "Searching for ArUco markers (IDs 0-3)...",
+                                (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
-            cv2.imshow("Calibration", rgb_frame)
+            if headless:
+                if config_data is not None and stable >= HEADLESS_STABLE_FRAMES:
+                    save_config(config_data, config_output)
+                    break
+                continue
 
+            cv2.imshow("Calibration", rgb)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('s') and corners_found:
-                rh, rw = rgb_frame.shape[:2]
-                config_data = {
-                    "corners": corners_found,
-                    "keys": ["C", "D", "E", "F", "G", "A", "B"],
-                    "floor_depth": floor_depth,
-                    "trigger_threshold": 50,
-                    "canvas_size": [rw, rh]
-                }
-                with open(config_output, "w") as f:
-                    json.dump(config_data, f, indent=4)
-                print(f"Calibration saved to {config_output}. Floor depth: {floor_depth}mm.")
+            if key == ord('s') and config_data is not None:
+                save_config(config_data, config_output)
                 break
             elif key == ord('q'):
+                log.info("Quit without saving.")
                 break
-
     finally:
         cap.release()
-        pipeline.stop()
-        cv2.destroyAllWindows()
+        camera.stop()
+        if not headless:
+            cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

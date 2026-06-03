@@ -1,4 +1,8 @@
-opencv-contrib-python
+opencv-contrib-python>=4.7
 pygame
 numpy
-pyorbbecsdk
+
+# NOTE: pyorbbecsdk is intentionally NOT listed here.
+# It has no arm64 PyPI wheel, so including it would make `pip install -r
+# requirements.txt` fail and skip the packages above. Install it separately by
+# building the OrbbecSDK Python bindings from source (+ udev rules). See docs/SETUP.md.

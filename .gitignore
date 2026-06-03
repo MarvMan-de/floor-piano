@@ -31,3 +31,7 @@ htmlcov/
 .vscode/
 .env
 .venv
+
+# Runtime-generated calibration output
+config.json
+src/config.json
