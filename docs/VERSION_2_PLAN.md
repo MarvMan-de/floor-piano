@@ -28,16 +28,19 @@ Eliminate the need for a keyboard, mouse, and monitor.
 *   **Physical Reset Button**: A hardware button on the box to clear the current `config.json` and force a fresh "Auto-Calibration" scan.
 
 ### 4. ⚡️ Performance Optimization
-*   **Hailo-8L + Astra Fusion**: Direct the Astra's 3D depth stream into the Hailo-8L's pose estimation pipeline to offload 100% of the Vision/AI processing from the Pi 5's CPU.
-*   **90 FPS Target**: Maintain a rock-solid 90 FPS for near-zero latency (under 10ms), matching the response time of a high-end digital piano.
+*   **CPU-only depth pipeline**: The depth-threshold trigger runs comfortably on the Pi 5 CPU — no NPU required for the core piano.
+*   **Realistic target**: ~30 FPS (Astra Pro depth-stream limit) and ~40–80 ms foot-to-audio latency.
+*   **Optional / deferred — Hailo-8L pose**: A Hailo-8L could later add RGB pose estimation for richer multi-person tracking. This is **not** part of the current hardware plan; note that pose models expect 3-channel RGB, not raw single-channel depth, so an "Astra→Hailo depth fusion" would not offload 100% of the work.
 
 ## 📝 Implementation Roadmap (Next Steps)
 1.  **[x] Phase 1: ArUco Integration**: `calibrate.py` auto-detects corners via `cv2.aruco`. Config saved to script dir (not CWD).
-2.  **[x] Phase 1b: SDK Migration**: Replaced dead `openni`/OpenNI2 bindings with official `pyorbbecsdk` (OrbbecSDK). Fixed all CWD-relative path bugs.
+2.  **[~] Phase 1b: SDK Migration**: Code uses `pyorbbecsdk` via a single `depth_camera.py` (lazy import, Y16 request + size guard). **Not yet verified on the real Astra Pro** — the Pro may need the OpenNI2 backend (see CODE_REVIEW blocker #1). Must be tested on hardware.
 3.  **[ ] Phase 2: 3D Plane Fitting**: Implement RANSAC plane fitting in place of current median floor sampling.
-4.  **[ ] Phase 3: Hailo-8L Pose Integration**: Wire foot detection model into Hailo NPU for multi-person support and sub-pixel accuracy.
-5.  **[ ] Phase 4: Headless Service**: Create `systemd` service and Python GPIO scripts for LED/Button control.
-6.  **[ ] Phase 5: Enclosure Design**: Design a 3D-printable box to house the Pi 5, Hailo Kit, and Astra Pro as a single unit.
+4.  **[~] Phase 3: Headless Service**: Done — headless calibrate auto-save, headless run loop, `SIGTERM` handling, logging, and a `systemd` unit template (`docs/floor-piano.service`). **Pending** — GPIO status LED + physical reset button.
+5.  **[ ] Phase 4: Enclosure Design**: Design a 3D-printable box to house the Pi 5 and Astra Pro as a single unit.
+6.  **[ ] Optional / deferred — Hailo-8L Pose**: Only if added later — wire an RGB pose model into a Hailo NPU for multi-person support. Not required for the core depth-based piano.
+
+> ⚠️ **Real blocker before anything else:** the RGB→Depth registration (CODE_REVIEW #2). ArUco corners are found in the RGB image but the warp is applied to the depth image; the two sensors differ in FOV/origin, so the key mapping is off. This needs the real camera (D2C alignment or detecting markers on the depth-registered stream) and gates Phase 2 onward.
 
 ---
 *Created on 2026-04-10 | Status: Drafting / Research Phase*

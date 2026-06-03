@@ -1,14 +1,13 @@
 # 🎹 Floor Piano v2.0
 
-Professional-grade interactive floor piano system optimized for Raspberry Pi 5 + Hailo-8L + Orbbec Astra Pro hardware stack.
+Interactive floor piano system for a Raspberry Pi 5 + Orbbec Astra Pro (3D depth camera) hardware stack.
 
 ## 🚀 Features
 
-- **3D Depth Triggering**: Ultra-low latency (<10ms) using Orbbec Astra Pro depth sensing
-- **Headless Operation**: Autonomous calibration with ArUco markers - no monitor required
-- **Hailo-8L AI Acceleration**: Hardware NPU present — pose estimation integration in progress
-- **Professional Audio**: Low-latency PyGame audio engine with high-quality samples
-- **Auto-Leveling**: Dynamic floor plane detection with RANSAC algorithm
+- **3D Depth Triggering**: Low-latency foot detection using Orbbec Astra Pro depth sensing
+- **ArUco Calibration**: Automatic corner detection via printed markers
+- **Low-Latency Audio**: PyGame audio engine with per-note samples
+- **Auto-Leveling**: Floor depth sampled (median) at calibration, re-levelable live (RANSAC plane-fit planned — see VERSION_2_PLAN)
 
 ## 📁 Project Structure
 
@@ -34,30 +33,43 @@ floor-piano/
    pip install -r requirements.txt
    ```
 
-2. **Calibrate System**:
+2. **Generate Audio Samples** (offline, no download needed):
+   ```bash
+   python src/sounds/generate_samples.py
+   ```
+
+3. **Calibrate System**:
    ```bash
    python src/calibrate.py
    ```
 
-3. **Run Piano**:
+4. **Run Piano**:
    ```bash
    python src/main.py
    ```
 
+## 🧪 Development & Tests
+
+The trigger logic lives in `src/detection.py` and is hardware-free, so it can be
+tested without a camera:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## 📋 Hardware Requirements
 
 - Raspberry Pi 5 (8GB RAM)
-- Raspberry Pi AI Kit (Hailo-8L + M.2 HAT+)
 - Orbbec Astra Pro 3D Camera
 - Official Raspberry Pi 27W Power Supply
 - USB Audio Adapter
 
 ## 🎯 Performance Targets
 
-- **90 FPS**: Real-time depth processing
-- **<10ms Latency**: From foot detection to audio playback
-- **Headless Operation**: Zero UI required after initial setup
-- **Auto-Recovery**: Self-correcting calibration on camera movement
+- **~30 FPS**: Real-time depth processing (Astra Pro depth-stream limit)
+- **Low latency**: ~40–80 ms from foot contact to audio playback
+- **Auto-Recovery**: Floor level can be re-sampled on the fly if the camera is bumped
 
 ## 🔧 Development Status
 
@@ -65,9 +77,9 @@ floor-piano/
 - ✅ 3D Depth Triggering (pyorbbecsdk)
 - ✅ ArUco Marker Calibration
 - ✅ Low-Latency Audio Engine
-- 🚧 Hailo-8L Pose Integration
 - 🚧 Systemd Service
 - 🚧 GPIO Status Indicators
+- 💤 Hailo-8L Pose Integration (deferred — not part of the current hardware plan)
 
 ---
 

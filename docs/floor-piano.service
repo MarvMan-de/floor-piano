@@ -1,0 +1,27 @@
+[Unit]
+Description=Floor Piano (depth-camera interactive floor piano)
+# Wait for the USB camera to be enumerated before starting.
+After=multi-user.target
+
+[Service]
+Type=simple
+
+# --- adjust these to your installation ---
+User=pi
+WorkingDirectory=/home/pi/floor-piano
+ExecStart=/usr/bin/python3 /home/pi/floor-piano/src/main.py
+
+# Headless audio: pygame/SDL must be told which audio device to use when there is
+# no desktop session. Adjust to your USB audio device (see `aplay -l`).
+Environment=SDL_AUDIODRIVER=alsa
+# Force headless mode (no GUI window) even if DISPLAY happens to be set.
+Environment=DISPLAY=
+
+# Restart if the camera drops out or the process dies.
+Restart=on-failure
+RestartSec=3
+# Give the loop time to shut the camera down on `systemctl stop`.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
