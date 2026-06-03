@@ -11,10 +11,10 @@ import numpy as np
 # Resolve sibling imports regardless of the working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import constants
-from audio import PianoAudio
 from depth_camera import DepthCamera, DepthCameraError
-from detection import (above_floor_mask, detect_hits, key_bounds,
-                       median_floor_depth, validate_config)
+from detection import (above_floor_mask, build_keyboard, detect_hits_labeled,
+                       keyboard_label_map, median_floor_depth,
+                       suppress_white_under_black, validate_config)
 
 log = logging.getLogger("floor_piano")
 
@@ -45,7 +45,6 @@ class FloorPiano:
 
     def __init__(self, config, camera=None, audio=None):
         self.config = config
-        self.keys = config["keys"]
         self.floor_depth = int(config.get("floor_depth", constants.DEFAULT_FLOOR_DEPTH))
         self.threshold = int(config.get("trigger_threshold", constants.DEFAULT_TRIGGER_THRESHOLD))
 
@@ -55,10 +54,24 @@ class FloorPiano:
         dst = np.float32([[0, 0], [self.target_width, 0],
                           [self.target_width, self.target_height], [0, self.target_height]])
         self.M = cv2.getPerspectiveTransform(corners, dst)
-        self.bounds = key_bounds(self.target_width, len(self.keys))
+
+        # Build the piano keyboard (14 white + 10 black by default) and a label map
+        # so each frame's per-key hit count is a single vectorised bincount.
+        num_white = int(config.get("num_white_keys", constants.DEFAULT_NUM_WHITE))
+        start_octave = int(config.get("start_octave", constants.START_OCTAVE))
+        self.keyboard = build_keyboard(num_white, self.target_width, self.target_height, start_octave)
+        self.key_names = [k.name for k in self.keyboard]
+        self.label_map = keyboard_label_map(self.keyboard, self.target_width, self.target_height)
+        log.info("Keyboard: %d white + %d black = %d keys (%s..%s)",
+                 num_white, len(self.keyboard) - num_white, len(self.keyboard),
+                 self.keyboard[0].name, self.keyboard[num_white - 1].name)
 
         self.camera = camera if camera is not None else DepthCamera()
-        self.audio = audio if audio is not None else PianoAudio(keys=self.keys)
+        if audio is not None:
+            self.audio = audio
+        else:
+            from audio import PianoAudio  # deferred so an injected audio sink needs no pygame
+            self.audio = PianoAudio(keys=self.key_names)
         self._running = False
 
     def warp(self, depth_array):
@@ -90,8 +103,10 @@ class FloorPiano:
     def process_frame(self, depth_array):
         """Pure-ish step: returns (warped_depth, set_of_active_note_names) and plays audio."""
         warped = self.warp(depth_array)
-        active_idx = detect_hits(warped, len(self.keys), self.floor_depth, self.threshold)
-        active = {self.keys[i] for i in active_idx}
+        active_idx = detect_hits_labeled(warped, self.label_map, len(self.keyboard),
+                                         self.floor_depth, self.threshold)
+        active_idx = suppress_white_under_black(active_idx, self.keyboard)
+        active = {self.key_names[i] for i in active_idx}
         self.audio.update(active)
         return warped, active
 
@@ -145,12 +160,20 @@ class FloorPiano:
     def _render(self, warped, active):
         mask = above_floor_mask(warped, self.floor_depth, self.threshold)
         vis = np.zeros((self.target_height, self.target_width, 3), dtype=np.uint8)
-        for i, note in enumerate(self.keys):
-            x0, x1 = self.bounds[i], self.bounds[i + 1]
-            color = (0, 255, 0) if note in active else (100, 100, 100)
-            cv2.rectangle(vis, (x0, 0), (x1, self.target_height), color, 2)
-            cv2.putText(vis, note, (x0 + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        vis[mask] = [0, 0, 255]
+        # Above-floor pixels (feet) as a red overlay first, so the keys draw on top.
+        vis[mask] = [0, 0, 80]
+        # White keys (outlines), then black keys (filled) on top — like a real keyboard.
+        for k in self.keyboard:
+            if k.kind == "white":
+                color = (0, 220, 0) if k.name in active else (90, 90, 90)
+                cv2.rectangle(vis, (k.x0, 0), (k.x1, self.target_height), color, 2)
+                cv2.putText(vis, k.name, (k.x0 + 3, self.target_height - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        for k in self.keyboard:
+            if k.kind == "black":
+                color = (0, 255, 0) if k.name in active else (35, 35, 35)
+                cv2.rectangle(vis, (k.x0, k.y0), (k.x1, k.y1), color, -1)
+                cv2.rectangle(vis, (k.x0, k.y0), (k.x1, k.y1), (200, 200, 200), 1)
         cv2.imshow("Floor Piano - 3D View", vis)
 
     def shutdown(self):

@@ -4,21 +4,40 @@ Pure data only (no logic, no heavy imports) so this is safe to import from
 anywhere without side effects.
 """
 
-# The 7 white keys of one octave (C major), laid out left -> right across the mat.
-DEFAULT_KEYS = ["C", "D", "E", "F", "G", "A", "B"]
+# --- keyboard layout -------------------------------------------------------
+
+# White keys of an octave, left -> right.
+WHITE_SCALE = ["C", "D", "E", "F", "G", "A", "B"]
+
+# Within an octave, a black (sharp) key follows these white-key positions.
+# There is NO black key after E (index 2) or B (index 6).
+BLACK_AFTER = {0: "C#", 1: "D#", 3: "F#", 4: "G#", 5: "A#"}
+
+# Default keyboard: 14 white + 10 black = 24 keys = 2 octaves (C4..B5).
+DEFAULT_NUM_WHITE = 14
+START_OCTAVE = 4
+
+# Black key geometry, relative to a white key / the mat depth.
+BLACK_WIDTH_RATIO = 0.6     # black key width as a fraction of a white key
+BLACK_HEIGHT_RATIO = 0.62   # black key covers this fraction of the mat depth (from the top)
 
 # ArUco marker IDs at the mat corners: 0=Top-Left, 1=Top-Right, 2=Bottom-Right, 3=Bottom-Left.
 CORNER_IDS = [0, 1, 2, 3]
 
-# Warped "piano" canvas that the depth image is projected onto (pixels).
-TARGET_WIDTH = 700
+# --- warp canvas -----------------------------------------------------------
+
+# Warped "piano" canvas the depth image is projected onto (pixels).
+# ~100 px per white key at the default 14-white layout.
+TARGET_WIDTH = 1400
 TARGET_HEIGHT = 200
+
+# --- triggering ------------------------------------------------------------
 
 # Depth trigger defaults (millimetres). Overridden by config.json at runtime.
 DEFAULT_FLOOR_DEPTH = 1000        # camera -> floor distance
 DEFAULT_TRIGGER_THRESHOLD = 50    # 5cm safety buffer above the floor
 
-# A key column must contain more than this many above-floor pixels to fire.
+# A key fires when more than this many of its pixels are above the floor.
 MIN_HIT_PIXELS = 150
 
 # Weight of the newest sample when re-leveling the floor (exponential moving average).

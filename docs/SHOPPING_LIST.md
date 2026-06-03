@@ -24,14 +24,15 @@ This list targets a **Raspberry Pi 5 + Orbbec Astra Pro** hardware stack using 3
 *   **Heavy Duty Tripod or C-Clamp Mount**: To position the Astra Pro securely looking down at the floor.
 
 ### 5. Floor Materials
-*   **Gaffer Tape (High Visibility)**: To mark the "keys" on the floor so performers know where to step.
+*   **A wide mat / floor area**: the default layout is **24 keys (14 white + 10 black, 2 octaves)**, so the playable strip is long — plan a wide, matte, light-coloured surface and mount the camera high enough to see all of it.
+*   **Gaffer Tape (High Visibility)**: To mark the "keys" on the floor so performers know where to step (incl. the narrower black keys at the back).
 *   **Anti-Fatigue Floor Mats (Optional)**: If this is for a long-duration exhibition, placing these under the camera's view makes it more comfortable for users.
 
 ---
 ### 🛒 Quick Checkout Checklist:
 - [ ] Raspberry Pi 5 (8GB)
 - [ ] Raspberry Pi Active Cooler
-- [ ] Orbbec Astra Pro (USB 3.0 version)
+- [ ] Orbbec Astra Pro (USB 2.0)
 - [ ] Official 27W Power Supply (Black or White)
 - [ ] USB 3.0 Extension Cable (Active, if mounting high)
 - [ ] USB Audio Adapter / USB Speakers

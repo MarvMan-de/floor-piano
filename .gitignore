@@ -35,3 +35,11 @@ htmlcov/
 # Runtime-generated calibration output
 config.json
 src/config.json
+
+# Generated ArUco markers (run tools/generate_aruco.py)
+markers/
+
+# Test videos / recordings (large, personal — keep out of the repo)
+*.mp4
+*.mov
+*.mkv

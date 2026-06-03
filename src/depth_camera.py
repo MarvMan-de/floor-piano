@@ -15,9 +15,11 @@ adds two safety nets discovered in the code review:
 """
 
 import logging
+import os
 
 import numpy as np
 
+import constants
 from detection import decode_depth
 
 log = logging.getLogger(__name__)
@@ -119,6 +121,87 @@ class DepthCamera:
             except Exception:
                 pass
             self._pipeline = None
+
+
+class VideoDepthCamera:
+    """A DepthCamera-compatible source that replays an MP4 (or any video file).
+
+    Drop-in replacement for DepthCamera so the full warp -> detect -> audio path
+    can be exercised from a *recording* without an Orbbec camera attached:
+
+        FloorPiano(config, camera=VideoDepthCamera("clip.mp4"))
+
+    A normal video carries no real depth, so every frame is converted to
+    grayscale and its brightness mapped linearly onto a millimetre depth range.
+    By DEFAULT a dark object is treated as "closer" (a foot dipping toward the
+    camera) and bright pixels as the floor — tune ``floor_depth`` / ``near_depth``
+    / ``invert`` until your clip actually triggers the keys.
+
+    cv2 is imported lazily inside ``start()`` so importing this module stays
+    cheap and dependency-free, consistent with the rest of the file.
+    """
+
+    def __init__(self, path, floor_depth=None, near_depth=None,
+                 invert=False, loop=False):
+        self.path = path
+        self.floor_depth = int(floor_depth) if floor_depth is not None \
+            else constants.DEFAULT_FLOOR_DEPTH
+        # Map the brightest/darkest pixel comfortably above the trigger plane so a
+        # full-intensity "foot" fires by default (floor - 200mm, like sweep_frames).
+        self.near_depth = int(near_depth) if near_depth is not None \
+            else max(1, self.floor_depth - 200)
+        self.invert = bool(invert)
+        self.loop = bool(loop)
+        self._cap = None
+        self.width = None
+        self.height = None
+
+    def start(self):
+        import cv2
+        if not os.path.exists(self.path):
+            raise DepthCameraError(f"video file not found: {self.path}")
+        self._cap = cv2.VideoCapture(self.path)
+        if not self._cap.isOpened():
+            self._cap = None
+            raise DepthCameraError(
+                f"could not open video '{self.path}' — is it a readable mp4? "
+                "OpenCV needs the right codecs (try `pip install opencv-contrib-python`)."
+            )
+        self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        log.info("Video source opened: %s (%dx%d)", self.path, self.width, self.height)
+        return self
+
+    def read_depth(self):
+        """Return the next frame as an HxW uint16 depth-like array, or None at EOF."""
+        import cv2
+        if self._cap is None:
+            raise DepthCameraError("video not started; call start() first")
+
+        ok, frame = self._cap.read()
+        if not ok:
+            if not self.loop:
+                return None
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self._cap.read()
+            if not ok:
+                return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if self.invert:
+            gray = 255.0 - gray
+        # dark (0) -> near_depth (close, triggers); bright (255) -> floor_depth.
+        span = self.floor_depth - self.near_depth
+        depth = self.near_depth + (gray / 255.0) * span
+        return depth.astype(np.uint16)
+
+    def stop(self):
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+            self._cap = None
 
 
 class MockDepthCamera:

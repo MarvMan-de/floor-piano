@@ -37,5 +37,18 @@ def test_write_wav_produces_a_real_riff_wave(tmp_path):
         assert w.getnframes() == int(g.SAMPLE_RATE * g.DURATION)
 
 
-def test_all_seven_notes_are_defined():
-    assert set(g.NOTE_FREQS) == {"C", "D", "E", "F", "G", "A", "B"}
+def test_build_note_list_is_24_chromatic():
+    notes = g.build_note_list()
+    assert len(notes) == 24
+    assert notes[0] == "C4"
+    assert notes[-1] == "B5"
+
+
+def test_note_to_freq_reference_pitches():
+    assert abs(g.note_to_freq("A4") - 440.0) < 1e-6
+    assert abs(g.note_to_freq("C4") - 261.626) < 0.01
+
+
+def test_generator_notes_match_keyboard_layout():
+    import detection as d
+    assert set(g.build_note_list()) == set(d.keyboard_note_names(14, 4))

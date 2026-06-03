@@ -126,7 +126,7 @@ def test_median_floor_depth_returns_none_when_too_sparse():
 def good_config():
     return {
         "corners": [[0, 0], [10, 0], [10, 10], [0, 10]],
-        "keys": ["C", "D", "E"],
+        "num_white_keys": 14,
         "floor_depth": 1000,
         "trigger_threshold": 50,
     }
@@ -136,7 +136,7 @@ def test_validate_config_accepts_good_config():
     assert d.validate_config(good_config()) is True
 
 
-@pytest.mark.parametrize("missing", ["corners", "keys", "floor_depth", "trigger_threshold"])
+@pytest.mark.parametrize("missing", ["corners", "num_white_keys", "floor_depth", "trigger_threshold"])
 def test_validate_config_rejects_missing_key(missing):
     cfg = good_config()
     cfg.pop(missing)
@@ -158,9 +158,10 @@ def test_validate_config_rejects_floor_not_above_threshold():
         d.validate_config(cfg)
 
 
-def test_validate_config_rejects_empty_keys():
+@pytest.mark.parametrize("bad", [0, -3, 1.5, "14", True])
+def test_validate_config_rejects_bad_num_white_keys(bad):
     cfg = good_config()
-    cfg["keys"] = []
+    cfg["num_white_keys"] = bad
     with pytest.raises(ValueError):
         d.validate_config(cfg)
 

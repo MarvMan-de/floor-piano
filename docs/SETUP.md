@@ -49,19 +49,28 @@ You can verify almost everything except the camera itself, in this order:
    ```bash
    pip install -r requirements-dev.txt && pytest
    ```
-   Detection, geometry, decode and config logic — 51 tests.
+   Detection, geometry, keyboard layout, decode and config logic — 69 tests.
 2. **Samples (stdlib only):**
    ```bash
    python3 src/sounds/generate_samples.py
    ```
 3. **Audio device (pygame):** confirm your USB speaker works.
    ```bash
-   python3 src/sounds/play_test.py    # should play C D E F G A B
+   python3 src/sounds/play_test.py    # plays all 24 chromatic notes C4..B5
    ```
 4. **Full pipeline minus camera (cv2 + pygame):** a synthetic foot sweeps the keys —
    you should *hear* the scale. This proves warp → detect → audio end-to-end.
    ```bash
    python3 src/demo_mock.py
+   ```
+   To test against a **recorded video instead of a synthetic sweep**, feed it an
+   MP4 — each frame is turned into a depth-like image (brightness → millimetres,
+   dark = close by default). Tune with `--invert` / `--floor` / `--near` until
+   your clip triggers; add `--show` for the detection view, `--no-audio` to run
+   without pygame:
+   ```bash
+   python3 src/demo_video.py clip.mp4
+   python3 src/demo_video.py clip.mp4 --invert --loop --show
    ```
 5. **Print the markers (cv2):** prepare for on-site calibration.
    ```bash
@@ -76,8 +85,9 @@ registration need the real camera.
 The Astra Pro is a structured-light depth camera — mind its physics:
 
 *   **Minimum range ~0.6 m.** Anything closer reads as 0 (invalid). Mount high enough.
-*   **Field of view.** Looking straight down from ~1.0 m covers only ~1.1 m width. For
-    7 keys + feet, mount higher (e.g. 1.5–2.0 m) or accept a narrower mat.
+*   **Field of view.** Looking straight down from ~1.0 m covers only ~1.1 m width. The
+    default layout is **24 keys (14 white + 10 black = 2 octaves, C4–B5)**, so the mat is
+    wide — mount the camera high (e.g. 2.0–2.5 m) so the whole keyboard fits the frame.
 *   **Lighting.** Structured-light IR is disturbed by direct sunlight; dark/glossy floors
     absorb IR and create holes (0-pixels) that read as "no foot". Prefer indoor, matte,
     light-coloured surfaces.

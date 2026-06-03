@@ -4,6 +4,8 @@ Interactive floor piano system for a Raspberry Pi 5 + Orbbec Astra Pro (3D depth
 
 ## 🚀 Features
 
+- **24-Key Keyboard**: 2 full octaves — 14 white + 10 black keys (C4–B5), with a real
+  piano layout (black keys narrower, at the back, none between E–F or B–C)
 - **3D Depth Triggering**: Low-latency foot detection using Orbbec Astra Pro depth sensing
 - **ArUco Calibration**: Automatic corner detection via printed markers
 - **Low-Latency Audio**: PyGame audio engine with per-note samples

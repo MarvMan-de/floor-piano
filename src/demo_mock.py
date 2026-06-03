@@ -2,7 +2,7 @@
 
 Drives the real warp -> detect -> audio path with synthetic depth frames, so you
 can verify (and HEAR) the piano on the Pi WITHOUT an Orbbec camera attached.
-A synthetic 'foot' sweeps across the 7 keys — you should hear C D E F G A B in order.
+A synthetic 'foot' visits each of the 24 keys (14 white + 10 black) in turn.
 
 Run:
     python3 src/demo_mock.py
@@ -18,9 +18,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import constants
-from audio import PianoAudio
 from depth_camera import MockDepthCamera
-from detection import sweep_frames
+from detection import keyboard_sweep_frames
 from main import FloorPiano
 
 log = logging.getLogger("demo")
@@ -35,23 +34,24 @@ def main():
     # feed already-"warped" synthetic frames straight through.
     config = {
         "corners": [[0, 0], [w, 0], [w, h], [0, h]],
-        "keys": list(constants.DEFAULT_KEYS),
+        "num_white_keys": constants.DEFAULT_NUM_WHITE,
+        "start_octave": constants.START_OCTAVE,
         "floor_depth": 1000,
         "trigger_threshold": constants.DEFAULT_TRIGGER_THRESHOLD,
     }
 
-    frames = sweep_frames(h, w, len(config["keys"]), floor_depth=1000, foot_depth=800)
-    piano = FloorPiano(config,
-                       camera=MockDepthCamera(frames),
-                       audio=PianoAudio(keys=config["keys"]))
+    # FloorPiano builds the keyboard + audio itself; reuse its keyboard for the sweep.
+    piano = FloorPiano(config, camera=MockDepthCamera([]))
+    frames = keyboard_sweep_frames(piano.keyboard, w, h,
+                                   floor_depth=config["floor_depth"], foot_depth=800)
 
-    log.info("Playing a synthetic foot sweep across %d keys (no camera) ...", len(config["keys"]))
+    log.info("Playing a synthetic foot sweep across %d keys (no camera) ...", len(piano.keyboard))
     try:
         for frame in frames:
             _, active = piano.process_frame(frame)
             if active:
                 log.info("trigger: %s", sorted(active))
-            time.sleep(0.12)
+            time.sleep(0.10)
     finally:
         piano.shutdown()
     log.info("Done. If you heard the notes, the detection + audio pipeline works.")

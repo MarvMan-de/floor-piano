@@ -94,12 +94,12 @@ def _corner_points():
 def test_build_config_orders_corners_and_is_valid():
     cfg = d.build_config(_corner_points(), floor_depth=950, rgb_shape=(480, 640, 3))
     assert cfg["corners"] == [[0, 0], [10, 0], [10, 10], [0, 10]]
-    assert cfg["keys"] == constants.DEFAULT_KEYS
+    assert cfg["num_white_keys"] == constants.DEFAULT_NUM_WHITE
     assert cfg["canvas_size"] == [640, 480]
     assert cfg["floor_depth"] == 950
     assert d.validate_config(cfg) is True
 
 
-def test_build_config_respects_custom_keys():
-    cfg = d.build_config(_corner_points(), 950, (480, 640, 3), keys=["C", "D"])
-    assert cfg["keys"] == ["C", "D"]
+def test_build_config_respects_custom_num_white():
+    cfg = d.build_config(_corner_points(), 950, (480, 640, 3), num_white=7)
+    assert cfg["num_white_keys"] == 7

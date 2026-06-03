@@ -3,8 +3,7 @@ import os
 
 import pygame
 
-from constants import DEFAULT_KEYS
-from detection import newly_pressed
+from detection import keyboard_note_names, newly_pressed, note_filename
 
 log = logging.getLogger(__name__)
 
@@ -21,7 +20,7 @@ class PianoAudio:
         # Default to sounds/ next to this script, not the current working dir.
         if samples_dir is None:
             samples_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sounds")
-        self.keys = keys if keys else DEFAULT_KEYS
+        self.keys = keys if keys else keyboard_note_names()
         self.samples = {}
         self.active_notes = set()
         self._mixer_ok = False
@@ -38,7 +37,7 @@ class PianoAudio:
             return
 
         for note in self.keys:
-            path = os.path.join(samples_dir, f"{note}.wav")
+            path = os.path.join(samples_dir, note_filename(note))
             if not os.path.exists(path):
                 log.warning("Sample for '%s' not found at %s — key will be silent.", note, path)
                 continue
