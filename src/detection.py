@@ -210,3 +210,21 @@ def stamp_foot(frame, key_index, num_keys, foot_depth, rows=None):
     r0, r1 = (0, frame.shape[0]) if rows is None else rows
     out[r0:r1, bounds[key_index]:bounds[key_index + 1]] = foot_depth
     return out
+
+
+def sweep_frames(height, width, num_keys, floor_depth=constants.DEFAULT_FLOOR_DEPTH,
+                 foot_depth=None, hold=3, gap=2):
+    """Build synthetic frames where a 'foot' visits each key in turn.
+
+    For each key: ``hold`` frames with the foot present, then ``gap`` empty floor
+    frames (so the edge-trigger re-arms). Drives the camera-free demo/tests.
+    """
+    if foot_depth is None:
+        foot_depth = floor_depth - 200
+    base = flat_floor_frame(height, width, floor_depth)
+    frames = []
+    for k in range(num_keys):
+        foot = stamp_foot(base, k, num_keys, foot_depth)
+        frames.extend([foot] * hold)
+        frames.extend([base] * gap)
+    return frames

@@ -41,6 +41,36 @@ python3 generate_samples.py
 ```
 (Optional: `./download_samples.sh` fetches real piano samples instead, but it needs a valid source URL — the old default is dead.)
 
+## 🧪 Testing Without the Camera
+
+You can verify almost everything except the camera itself, in this order:
+
+1. **Logic (numpy only):**
+   ```bash
+   pip install -r requirements-dev.txt && pytest
+   ```
+   Detection, geometry, decode and config logic — 51 tests.
+2. **Samples (stdlib only):**
+   ```bash
+   python3 src/sounds/generate_samples.py
+   ```
+3. **Audio device (pygame):** confirm your USB speaker works.
+   ```bash
+   python3 src/sounds/play_test.py    # should play C D E F G A B
+   ```
+4. **Full pipeline minus camera (cv2 + pygame):** a synthetic foot sweeps the keys —
+   you should *hear* the scale. This proves warp → detect → audio end-to-end.
+   ```bash
+   python3 src/demo_mock.py
+   ```
+5. **Print the markers (cv2):** prepare for on-site calibration.
+   ```bash
+   python3 tools/generate_aruco.py    # writes markers/marker_0..3.png
+   ```
+
+Only the Orbbec depth stream (`calibrate.py` / `main.py`) and the RGB→depth
+registration need the real camera.
+
 ## 📷 Camera Placement
 
 The Astra Pro is a structured-light depth camera — mind its physics:

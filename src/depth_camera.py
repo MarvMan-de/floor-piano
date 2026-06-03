@@ -119,3 +119,33 @@ class DepthCamera:
             except Exception:
                 pass
             self._pipeline = None
+
+
+class MockDepthCamera:
+    """A DepthCamera-compatible fake that serves preset frames — no hardware/SDK.
+
+    Drop-in replacement for DepthCamera so main.FloorPiano can be run on the Pi
+    (or anywhere) without an Orbbec camera attached:
+
+        FloorPiano(config, camera=MockDepthCamera(frames))
+    """
+
+    def __init__(self, frames, loop=False):
+        self._frames = list(frames)
+        self._loop = loop
+        self._i = 0
+
+    def start(self):
+        return self
+
+    def read_depth(self):
+        if self._i >= len(self._frames):
+            if not self._loop:
+                return None
+            self._i = 0
+        frame = self._frames[self._i]
+        self._i += 1
+        return frame
+
+    def stop(self):
+        pass
