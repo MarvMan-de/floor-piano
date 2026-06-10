@@ -11,7 +11,7 @@ import numpy as np
 # Resolve sibling imports regardless of the working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import constants
-from depth_camera import DepthCamera, DepthCameraError
+from depth_camera import DepthCameraError, make_depth_camera
 from detection import (HitTracker, above_floor_mask, build_keyboard,
                        detect_hits_blobs, keyboard_label_map, median_floor_depth,
                        validate_config)
@@ -69,7 +69,7 @@ class FloorPiano:
         # so depth noise can't retrigger a held note frame after frame.
         self.tracker = HitTracker(int(config.get("release_frames", constants.RELEASE_FRAMES)))
 
-        self.camera = camera if camera is not None else DepthCamera()
+        self.camera = camera if camera is not None else make_depth_camera()
         if audio is not None:
             self.audio = audio
         else:

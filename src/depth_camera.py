@@ -131,6 +131,120 @@ class DepthCamera:
             self._pipeline = None
 
 
+class OpenNI2DepthCamera:
+    """DepthCamera-compatible source for the legacy Astra Pro via OpenNI2.
+
+    The Astra Pro's depth sensor is NOT served by pyorbbecsdk (OrbbecSDK v2):
+    it is a legacy OpenNI2 device (depth over OpenNI2, RGB as a *separate* UVC
+    webcam). This backend reads depth through the ``openni`` Python bindings
+    (``pip install openni``), which wrap ``libOpenNI2.so`` + the Orbbec driver,
+    and returns the same HxW uint16 *millimetre* frames as DepthCamera — so
+    FloorPiano needs no other change. Select it at runtime:
+
+        FLOOR_PIANO_CAMERA=openni2 python3 src/main.py
+
+    The PIXEL_FORMAT_DEPTH_1_MM video mode makes frame values already
+    millimetres (depth scale 1.0), so no per-device scaling is needed.
+
+    NOTE: written WITHOUT the camera attached — see docs/ASTRA_PRO_PI5_SETUP.md.
+    The control flow and OpenNI2 calls follow the documented bindings, but the
+    resolution/fps the device actually advertises and the exact buffer layout
+    can only be confirmed on real hardware (marked TODO below). Everything that
+    can be tested without the device is covered in tests/test_openni2_camera.py.
+    """
+
+    def __init__(self, width=640, height=480, fps=30):
+        # 640x480@30 is the Astra Pro's standard depth mode; set_video_mode is
+        # best-effort below, so a device that only offers its default mode still
+        # works. TODO(hardware): confirm the advertised mode list.
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._dev = None
+        self._stream = None
+
+    def start(self):
+        """Open and start the OpenNI2 depth stream. Raises DepthCameraError."""
+        try:
+            from openni import openni2, _openni2 as c_api
+        except ImportError as e:
+            raise DepthCameraError(
+                "openni bindings not installed. Run 'pip install openni' AND install "
+                "the Orbbec OpenNI2 SDK redist (point OPENNI2_REDIST at it). "
+                "See docs/ASTRA_PRO_PI5_SETUP.md."
+            ) from e
+
+        # OPENNI2_REDIST points initialize() at libOpenNI2.so + the Orbbec driver.
+        # Passing it explicitly avoids 'NiInitialize failed' when the env file
+        # isn't sourced (e.g. under systemd).
+        redist = os.environ.get("OPENNI2_REDIST") or os.environ.get("OPENNI2_REDIST64")
+        try:
+            openni2.initialize(redist) if redist else openni2.initialize()
+            self._dev = openni2.Device.open_any()
+            self._stream = self._dev.create_depth_stream()
+            try:
+                self._stream.set_video_mode(c_api.OniVideoMode(
+                    pixelFormat=c_api.OniPixelFormat.ONI_PIXEL_FORMAT_DEPTH_1_MM,
+                    resolutionX=self.width, resolutionY=self.height, fps=self.fps))
+            except Exception as e:
+                log.warning("Could not set %dx%d@%dfps depth mode (%s) — using device "
+                            "default.", self.width, self.height, self.fps, e)
+            self._stream.start()
+        except DepthCameraError:
+            raise
+        except Exception as e:
+            self.stop()
+            raise DepthCameraError(
+                f"failed to start Astra Pro depth via OpenNI2: {e}. If this is a "
+                "'USB endpoint not found' error, see the troubleshooting section in "
+                "docs/ASTRA_PRO_PI5_SETUP.md (known ARM64 SDK issue)."
+            ) from e
+
+        log.info("Astra Pro depth stream started via OpenNI2.")
+        return self
+
+    def read_depth(self):
+        """Return the latest depth frame as an HxW uint16 mm array, or None."""
+        if self._stream is None:
+            raise DepthCameraError("camera not started; call start() first")
+
+        # A transient read hiccup must not kill the loop — treat it as "no frame
+        # this cycle"; main.py's stall watchdog escalates if it never recovers.
+        try:
+            frame = self._stream.read_frame()
+        except Exception as e:
+            log.warning("OpenNI2 depth read failed (%s) — skipping frame.", e)
+            return None
+        if frame is None:
+            return None
+
+        # primesense/openni bindings expose .height/.width as attributes; some
+        # builds use getters. TODO(hardware): confirm which on the real device.
+        h = frame.height if hasattr(frame, "height") else frame.get_height()
+        w = frame.width if hasattr(frame, "width") else frame.get_width()
+        # get_buffer_as_uint16() exposes the frame via the buffer protocol;
+        # decode_depth guards the byte count and returns a contiguous, owned
+        # uint16 copy (the SDK recycles its buffer on the next read).
+        depth = decode_depth(frame.get_buffer_as_uint16(), h, w)
+        if depth is None:
+            log.warning("Unexpected OpenNI2 depth frame size (%dx%d); skipping frame.", w, h)
+        return depth
+
+    def stop(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            self._stream = None
+        self._dev = None
+        try:
+            from openni import openni2
+            openni2.unload()
+        except Exception:
+            pass
+
+
 class VideoDepthCamera:
     """A DepthCamera-compatible source that replays an MP4 (or any video file).
 
@@ -354,3 +468,19 @@ class MockDepthCamera:
 
     def stop(self):
         pass
+
+
+def make_depth_camera():
+    """Return the depth source selected by the FLOOR_PIANO_CAMERA env var.
+
+    Default 'orbbec' (pyorbbecsdk — Astra 2 / Femto / Gemini). Set
+    FLOOR_PIANO_CAMERA=openni2 for the legacy Astra Pro, which pyorbbecsdk does
+    NOT serve (see docs/ASTRA_PRO_PI5_SETUP.md). Keeps the backend choice out of
+    main.py so swapping cameras is one env var, no code change.
+    """
+    backend = os.environ.get("FLOOR_PIANO_CAMERA", "orbbec").strip().lower()
+    if backend in ("openni2", "openni", "astra", "astrapro"):
+        return OpenNI2DepthCamera()
+    if backend not in ("orbbec", "", "pyorbbecsdk", "default"):
+        log.warning("Unknown FLOOR_PIANO_CAMERA=%r — falling back to 'orbbec'.", backend)
+    return DepthCamera()
