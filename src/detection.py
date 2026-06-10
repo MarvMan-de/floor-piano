@@ -61,14 +61,23 @@ def decode_depth(raw_bytes, height, width):
 
 # --- triggering ------------------------------------------------------------
 
-def above_floor_mask(warped_depth, floor_depth, threshold):
+def above_floor_mask(warped_depth, floor_depth, threshold, max_press_height=None):
     """Boolean mask of pixels sitting *above* the floor plane (i.e. a foot).
 
     A pixel counts only if it has a valid reading (> 0) and is closer to the
     camera than ``floor_depth - threshold`` (the safety buffer in mm).
+
+    With ``max_press_height`` set, pixels HIGHER than that many mm above the
+    floor are excluded too — so a foot swinging mid-step, a knee or a torso
+    over the mat doesn't press keys, only things near floor level do. Leave it
+    None where the full above-floor silhouette is wanted (e.g. masking out a
+    standing person before re-sampling the floor depth).
     """
     trigger_depth = floor_depth - threshold
-    return (warped_depth > 0) & (warped_depth < trigger_depth)
+    mask = (warped_depth > 0) & (warped_depth < trigger_depth)
+    if max_press_height is not None:
+        mask &= warped_depth > floor_depth - max_press_height
+    return mask
 
 
 def detect_hits(warped_depth, num_keys, floor_depth, threshold,
@@ -181,6 +190,96 @@ def detect_hits_labeled(warped_depth, label_map, num_keys, floor_depth, threshol
     return active
 
 
+def detect_hits_blobs(warped_depth, label_map, num_keys, floor_depth, threshold,
+                      min_hit_pixels=constants.MIN_HIT_PIXELS, min_key_overlap=None,
+                      max_press_height=constants.MAX_PRESS_HEIGHT, sticky=()):
+    """One above-floor blob (= one foot) presses exactly ONE key.
+
+    detect_hits_labeled counts pixels per key over the whole mask, so a single
+    foot straddling a boundary fires BOTH keys. Here the mask is split into
+    connected components first; each blob big enough to be a foot
+    (area > min_hit_pixels) presses only the key holding the largest share of
+    it (and only if that share is at least ``min_key_overlap`` pixels, so a
+    blob mostly outside the keyboard doesn't fire a key it barely grazes).
+    Two feet are two blobs, so chords still work.
+
+    Only pixels within ``max_press_height`` mm of the floor count, so body
+    parts passing high above the mat are ignored entirely.
+
+    ``sticky`` is the set of currently-held key indices (the HitTracker's
+    state): a blob sitting ~50/50 on a key boundary would otherwise flip its
+    argmax with every frame's noise and machine-gun both notes. A held key
+    keeps the blob unless a competitor truly dominates it (>~1.4x pixels).
+
+    Needs cv2 (for connectedComponents) — same dependency main.py already has
+    for the perspective warp. The mask is morphologically closed first so a
+    foot fragmented by depth holes stays ONE blob instead of firing twice.
+    """
+    import cv2
+    if min_key_overlap is None:
+        min_key_overlap = max(1, min_hit_pixels // 2)
+    mask = above_floor_mask(warped_depth, floor_depth, threshold, max_press_height)
+    active = set()
+    if not mask.any():
+        return active
+    closed = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE,
+                              np.ones((5, 5), np.uint8))
+    n, blob_labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    for b in range(1, n):  # 0 is background
+        if stats[b, cv2.CC_STAT_AREA] <= min_hit_pixels:
+            continue
+        keys_under = label_map[blob_labels == b]
+        keys_under = keys_under[keys_under >= 0]
+        if keys_under.size == 0:
+            continue
+        counts = np.bincount(keys_under, minlength=num_keys)
+        k = int(np.argmax(counts))
+        if k not in sticky:
+            # boundary hysteresis: stay on a held key unless the argmax key
+            # truly dominates it. (If the argmax key is itself held, it keeps
+            # the blob — never hand it to a weaker held neighbour.)
+            held = max((h for h in sticky if h != k and counts[h] >= 0.7 * counts[k]),
+                       key=lambda h: counts[h], default=None)
+            if held is not None:
+                k = held
+        if counts[k] >= min_key_overlap:
+            active.add(k)
+    return active
+
+
+class HitTracker:
+    """Debounce raw per-frame detections into stable held keys.
+
+    A key starts sounding the first frame it is detected (no added latency)
+    but is released only after ``release_frames`` consecutive frames without
+    it — a noisy mask that drops a key for one frame can no longer retrigger
+    the note in a machine-gun loop.
+    """
+
+    def __init__(self, release_frames=constants.RELEASE_FRAMES):
+        self.release_frames = max(1, int(release_frames))
+        self.held = set()
+        self._missing = {}
+
+    def update(self, detected):
+        """Feed one frame's raw detection set; returns the stable held set."""
+        detected = set(detected)
+        self.held |= detected
+        for k in list(self.held):
+            if k in detected:
+                self._missing[k] = 0
+            else:
+                self._missing[k] = self._missing.get(k, 0) + 1
+                if self._missing[k] >= self.release_frames:
+                    self.held.discard(k)
+                    del self._missing[k]
+        return set(self.held)
+
+    def reset(self):
+        self.held = set()
+        self._missing = {}
+
+
 def suppress_white_under_black(active, keys):
     """Drop white keys that overlap an active black key.
 
@@ -227,13 +326,14 @@ def scale_point_to_depth(point_xy, rgb_shape, depth_shape):
     return (point_xy[0] * dw / rw, point_xy[1] * dh / rh)
 
 
-def sample_floor_depth(depth_array, center_xy, rgb_shape,
-                       default=constants.DEFAULT_FLOOR_DEPTH, patch=10):
-    """Median floor depth in a small patch around the mat centre.
+def sample_floor_depth(depth_array, center_xy, rgb_shape, patch=10):
+    """Median floor depth in a small patch around the mat centre, or None.
 
     ``center_xy`` is in RGB-image coordinates; it is scaled into depth space.
-    Returns ``default`` if the point is too close to the edge or no valid depth
-    pixels are found.
+    Returns None when the point is too close to the edge or no valid depth
+    pixels exist there — callers must treat that as "not calibratable right
+    now", NOT silently substitute a default (a wrong floor depth makes the
+    piano dead or constantly firing).
     """
     dx, dy = scale_point_to_depth(center_xy, rgb_shape, depth_array.shape)
     dx, dy = int(dx), int(dy)
@@ -243,7 +343,7 @@ def sample_floor_depth(depth_array, center_xy, rgb_shape,
         valid = sample[sample > 0]
         if valid.size > 0:
             return int(np.median(valid))
-    return default
+    return None
 
 
 def build_config(corner_points, floor_depth, rgb_shape,
@@ -287,9 +387,27 @@ def validate_config(cfg):
     for i, pt in enumerate(cfg["corners"]):
         if len(pt) != 2:
             raise ValueError(f"config corner {i} must be [x, y], got {pt}")
+        for v in pt:
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(f"config corner {i} has a non-numeric coordinate: {pt}")
+    # Shoelace area of the TL,TR,BR,BL polygon. Zero/near-zero = degenerate
+    # (repeated or collinear corners); negative = wrong winding vs the warp
+    # destination (markers swapped / mirrored placement) — both would produce
+    # a folded or mirrored key grid with no visible error later.
+    pts = cfg["corners"]
+    area2 = sum(pts[i][0] * pts[(i + 1) % 4][1] - pts[(i + 1) % 4][0] * pts[i][1]
+                for i in range(4))
+    if area2 < 200:  # signed double-area, image coords (y down): TL,TR,BR,BL is positive
+        raise ValueError(
+            "config 'corners' do not form a valid TL,TR,BR,BL quad "
+            f"(signed area {area2 / 2:.0f}) — markers swapped or calibration degenerate?"
+        )
     if not isinstance(cfg["num_white_keys"], int) or isinstance(cfg["num_white_keys"], bool) \
             or cfg["num_white_keys"] <= 0:
         raise ValueError(f"config 'num_white_keys' must be a positive integer, got {cfg['num_white_keys']}")
+    if "start_octave" in cfg and (not isinstance(cfg["start_octave"], int)
+                                  or isinstance(cfg["start_octave"], bool)):
+        raise ValueError(f"config 'start_octave' must be an integer, got {cfg['start_octave']}")
     for k in ("floor_depth", "trigger_threshold"):
         if not isinstance(cfg[k], (int, float)) or isinstance(cfg[k], bool):
             raise ValueError(f"config '{k}' must be a number, got {type(cfg[k]).__name__}")

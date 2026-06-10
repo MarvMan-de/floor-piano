@@ -34,6 +34,39 @@ Depth-Profil? sonst OpenNI2) und **#2** (RGB→Depth-Registrierung — das Kernf
 Auflösungsskalierung beseitigt die Parallaxe nicht → echte Lösung ist D2C-Alignment vor Ort).
 Optional später: GPIO-LED/Reset-Button, RANSAC (Phase 2), Tiefen-Lochfüllung.
 
+## ✅ Detektions-Rework + 3. Multi-Agent-Review (2026-06-09)
+
+Das Erkennungssystem wurde überarbeitet und **gegen die echten Mat-Videos verifiziert**
+(`videos/source/besser.mp4` + WhatsApp-Clip; Frame-für-Frame-Abgleich der Trigger gegen die
+sichtbare Fußposition auf der bemalten Matte):
+
+- **Blob-Detektion** (`detect_hits_blobs`): Ein Fuß = ein zusammenhängender Blob = genau EINE
+  Taste (Mehrheits-Overlap statt Pixelzählung pro Taste) → kein Doppel-Trigger mehr auf
+  Tastengrenzen; zwei Füße = zwei Blobs = Akkorde funktionieren. Boundary-Hysterese
+  (`sticky`): ein 50/50 auf der Grenze stehender Fuß flattert nicht mehr zwischen zwei Noten.
+- **Press-Height-Band** (`MAX_PRESS_HEIGHT` 250mm): nur Pixel nahe am Boden drücken Tasten —
+  ein schwingender Fuß/Knie/Oberkörper über der Matte löst nichts mehr aus (war Blocker im
+  3. Review).
+- **HitTracker-Debounce**: Release erst nach 3 Frames ohne Erkennung → Rauschen kann gehaltene
+  Noten nicht mehr maschinengewehrartig neu triggern. `suppress_white_under_black` aus dem
+  Laufzeitpfad entfernt (zerstörte legitime Schwarz+Weiß-Akkorde; Blob-argmax übernimmt das).
+- **Matten-Auto-Kalibrierung** (`mat_calibration.py`): Ecken, Orientierung (alle 4 Flips,
+  auch gespiegelte Clips) und Sub-Pixel-Verfeinerung direkt aus den aufgedruckten Tasten —
+  ohne ArUco. Auf besser.mp4: Raster-Residuum 9.2 → **0.5 px**. In `calibrate.py` als
+  Fallback integriert (`--source auto|aruco|mat`).
+- **Video-Testpfad**: `--motion` nutzt jetzt einen festen Median-Hintergrund statt MOG2
+  (kein "Einfrieren" stehender Füße, keine Ghosts); Render zeigt die gewarpte Matte in
+  Farbe + Maskenkontur → Fehlausrichtung wäre sofort sichtbar.
+- **Härtung aus dem 3. Review (25 bestätigte Findings):** `MIN_HIT_PIXELS` skaliert mit der
+  Warp-Vergrößerung; Kamera-Stall-Watchdog (Exit nach ~5s ohne Frames → systemd-Restart);
+  Ecken werden bei RGB≠Depth-Auflösung umskaliert (`canvas_size`); Mixer auf 32 Kanäle +
+  Retry wenn USB-Audio spät kommt; `sample_floor_depth` liefert None statt stillem Default;
+  Boden-Median über das Stabilitätsfenster + Spread-Check; Headless-Kalibrierung mit Timeout;
+  RGB-Probe erkennt IR/Mono-Nodes; `validate_config` prüft Korner-Geometrie (Winding/NaN);
+  SIGTERM vor run() geht nicht mehr verloren; FPS-Log misst echte Fenster; DISPLAY-tot-Guard.
+- **108 pytest-Tests** (vorher 69), inkl. End-to-End-Pipeline-Tests (FloorPiano mit
+  injizierter Kamera/Audio) und synthetischer Matten-Kalibrierung in allen Orientierungen.
+
 ### Vor dem ersten Start auf der Hardware (manuell)
 1. **Astra-Depth verifizieren (entscheidend):**
    `python3 -c "from pyorbbecsdk import Pipeline,OBSensorType; p=Pipeline(); print(len(p.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)))"`

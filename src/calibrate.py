@@ -1,7 +1,25 @@
+"""Calibrate the floor piano: find the mat corners + measure the floor depth.
+
+Two corner sources, tried in this order (selectable with --source):
+
+  * aruco — printed ArUco markers IDs 0-3 at the mat corners (0=TL, 1=TR,
+            2=BR, 3=BL as seen by the camera);
+  * mat   — no markers: the printed piano mat itself is detected, its
+            orientation resolved from the black-key pattern and the grid
+            refined onto the painted keys (see mat_calibration.py).
+
+The floor depth is sampled every frame at the mat centre and the saved value
+is the median over the stable window — with a spread check, so a person
+stepping through the scene (or standing on the mat) can't poison the
+calibration. Keep the mat clear while calibrating.
+"""
+
+import argparse
 import json
 import logging
 import os
 import sys
+import time
 
 import cv2
 import numpy as np
@@ -9,21 +27,28 @@ import numpy as np
 # Resolve sibling imports regardless of the working directory.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import constants
+import mat_calibration
 from depth_camera import DepthCamera, DepthCameraError
-from detection import build_config, sample_floor_depth
+from detection import build_config, sample_floor_depth, validate_config
 
 log = logging.getLogger("calibrate")
 
 # Consecutive good detections required before auto-saving in headless mode.
 HEADLESS_STABLE_FRAMES = 15
+# Floor samples within the stable window may spread at most this much (mm).
+FLOOR_SPREAD_LIMIT = 60
+# Give up (exit 1) if headless calibration hasn't locked within this time.
+HEADLESS_TIMEOUT_S = 120.0
 
 
 def find_rgb_camera(max_index=5):
     """Return an opened cv2.VideoCapture for the Astra's UVC RGB stream, or None.
 
-    The Pi exposes several /dev/video* nodes (RGB, IR, metadata). We validate each
-    candidate with an actual 3-channel colour frame instead of trusting isOpened().
-    Set FLOOR_PIANO_RGB_INDEX to force a specific index if auto-detection misfires.
+    The Pi exposes several /dev/video* nodes (RGB, IR, metadata). We validate
+    each candidate with an actual colour frame: V4L2 converts even mono/IR
+    streams to 3-channel BGR, so a frame whose channels are all identical is a
+    grayscale/IR node in disguise and is rejected. Set FLOOR_PIANO_RGB_INDEX to
+    force a specific index if auto-detection misfires.
     """
     override = os.environ.get("FLOOR_PIANO_RGB_INDEX")
     indices = [int(override)] if override else range(max_index)
@@ -32,14 +57,18 @@ def find_rgb_camera(max_index=5):
         if cap.isOpened():
             ok, frame = cap.read()
             if ok and frame is not None and frame.ndim == 3 and frame.shape[2] == 3:
-                log.info("Using RGB camera at index %d (%dx%d).", i, frame.shape[1], frame.shape[0])
-                return cap
+                b, g, r = frame[:, :, 0], frame[:, :, 1], frame[:, :, 2]
+                if override or not ((b == g).all() and (g == r).all()):
+                    log.info("Using RGB camera at index %d (%dx%d).",
+                             i, frame.shape[1], frame.shape[0])
+                    return cap
+                log.info("Index %d delivers identical channels (IR/mono node) — skipping.", i)
         cap.release()  # not a usable colour camera; don't leak the handle
     return None
 
 
-def detect_corners(detector, rgb_frame):
-    """Return {id: (x, y) marker centre} for all 4 corner markers, else None.
+def detect_corners_aruco(detector, rgb_frame):
+    """Return the 4 marker centres as a TL,TR,BR,BL float array, else None.
 
     The marker *centre* is used as the corner reference. This insets the playable
     area by ~half a marker uniformly on all sides (fine for play); see SETUP.md.
@@ -52,9 +81,9 @@ def detect_corners(detector, rgb_frame):
         mid = int(ids[i][0])
         if mid in constants.CORNER_IDS:
             found[mid] = np.mean(corners[i][0], axis=0)
-    if all(mid in found for mid in constants.CORNER_IDS):
-        return found
-    return None
+    if not all(mid in found for mid in constants.CORNER_IDS):
+        return None
+    return np.float32([found[mid] for mid in constants.CORNER_IDS])
 
 
 def save_config(config_data, path):
@@ -63,18 +92,32 @@ def save_config(config_data, path):
     log.info("Calibration saved to %s (floor_depth=%dmm).", path, config_data["floor_depth"])
 
 
-def _annotate(rgb, found, floor_depth):
-    for mid in constants.CORNER_IDS:
-        pt = tuple(found[mid].astype(int))
-        cv2.circle(rgb, pt, 10, (0, 255, 0), -1)
-        cv2.putText(rgb, f"ID {mid}", pt, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(rgb, f"Floor: {floor_depth}mm  -  press 's' to save",
+def _annotate(rgb, corners, floor_depth, method):
+    pts = corners.astype(int)
+    cv2.polylines(rgb, [pts], True, (0, 255, 0), 2)
+    for i, pt in enumerate(pts):
+        cv2.circle(rgb, tuple(pt), 8, (0, 255, 0), -1)
+        cv2.putText(rgb, "TL TR BR BL".split()[i], tuple(pt),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    floor_txt = f"{floor_depth}mm" if floor_depth is not None else "no depth!"
+    cv2.putText(rgb, f"[{method}] Floor: {floor_txt}  -  press 's' to save",
                 (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
 
-def main():
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Calibrate the floor piano.")
+    p.add_argument("--source", choices=("auto", "aruco", "mat"), default="auto",
+                   help="corner source: ArUco markers, the printed mat itself, "
+                        "or auto (ArUco first, mat as fallback)")
+    p.add_argument("--white", type=int, default=constants.DEFAULT_NUM_WHITE,
+                   help="number of white keys on the mat")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    args = parse_args(argv)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_output = os.path.join(script_dir, "config.json")
     headless = not os.environ.get('DISPLAY')  # unset OR empty -> headless
@@ -92,44 +135,97 @@ def main():
         camera.stop()
         sys.exit(1)
 
-    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
+    detector = None
+    if args.source in ("auto", "aruco"):
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
 
-    log.info("--- PIANO CALIBRATION (%s mode) ---", "headless" if headless else "GUI")
-    log.info("Place ArUco markers IDs 0-3 at the mat corners (0=TL, 1=TR, 2=BR, 3=BL).")
+    log.info("--- PIANO CALIBRATION (%s mode, source=%s) ---",
+             "headless" if headless else "GUI", args.source)
+    log.info("Keep the mat clear of feet. ArUco IDs 0-3 (0=TL 1=TR 2=BR 3=BL) "
+             "are used when present; otherwise the mat itself is detected.")
     if headless:
-        log.info("Headless: auto-saving once markers stay detected for %d frames.",
-                 HEADLESS_STABLE_FRAMES)
+        log.info("Headless: auto-saving once detection stays stable for %d frames "
+                 "(timeout %.0fs).", HEADLESS_STABLE_FRAMES, HEADLESS_TIMEOUT_S)
     else:
         log.info("Press 's' to save, 'q' to quit.")
 
     stable = 0
+    floor_samples = []
+    started = time.monotonic()
+    last_progress = started
+    rgb_fail = 0
     try:
         while True:
+            if headless and time.monotonic() - started > HEADLESS_TIMEOUT_S:
+                log.error("Calibration did not lock within %.0fs — giving up.",
+                          HEADLESS_TIMEOUT_S)
+                sys.exit(1)
             ret, rgb = cap.read()
             if not ret:
+                rgb_fail += 1
+                if rgb_fail >= 100:
+                    log.error("RGB camera stopped delivering frames — giving up.")
+                    sys.exit(1)
+                time.sleep(0.05)
                 continue
+            rgb_fail = 0
             depth = camera.read_depth()
             if depth is None:
                 continue
 
-            found = detect_corners(detector, rgb)
+            corners, method = None, None
+            if detector is not None:
+                corners = detect_corners_aruco(detector, rgb)
+                method = "aruco" if corners is not None else None
+            if corners is None and args.source in ("auto", "mat"):
+                corners, info = mat_calibration.auto_calibrate(rgb, args.white)
+                if corners is not None:
+                    method = "mat"
+
             config_data = None
-            if found is not None:
-                center = (float(np.mean([found[m][0] for m in constants.CORNER_IDS])),
-                          float(np.mean([found[m][1] for m in constants.CORNER_IDS])))
+            floor_depth = None
+            if corners is not None:
+                center = (float(np.mean(corners[:, 0])), float(np.mean(corners[:, 1])))
                 floor_depth = sample_floor_depth(depth, center, rgb.shape)
-                config_data = build_config(found, floor_depth, rgb.shape)
-                stable += 1
-                if not headless:
-                    _annotate(rgb, found, floor_depth)
+                if floor_depth is None:
+                    log.warning("Markers/mat found but no valid depth at the mat centre "
+                                "— is the mat inside the depth camera's view?")
+                    stable, floor_samples = 0, []
+                else:
+                    floor_samples.append(floor_depth)
+                    window = floor_samples[-HEADLESS_STABLE_FRAMES:]
+                    if max(window) - min(window) > FLOOR_SPREAD_LIMIT:
+                        # Someone/something moving through the sample area.
+                        stable, floor_samples = 0, [floor_depth]
+                    else:
+                        stable += 1
+                    corner_points = {mid: corners[i]
+                                     for i, mid in enumerate(constants.CORNER_IDS)}
+                    config_data = build_config(corner_points, int(np.median(window)),
+                                               rgb.shape, num_white=args.white)
+                    # Never count (or save) a config main.py would reject — e.g.
+                    # a mirrored/degenerate corner quad from a bad mat detection.
+                    try:
+                        validate_config(config_data)
+                    except ValueError as e:
+                        log.warning("Rejecting unusable detection (%s): %s", method, e)
+                        config_data = None
+                        stable, floor_samples = 0, []
+                    if not headless and config_data is not None:
+                        _annotate(rgb, corners, floor_depth, method)
             else:
-                stable = 0
+                stable, floor_samples = 0, []
                 if not headless:
-                    cv2.putText(rgb, "Searching for ArUco markers (IDs 0-3)...",
+                    cv2.putText(rgb, "Searching for ArUco markers / the mat...",
                                 (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
             if headless:
+                now = time.monotonic()
+                if now - last_progress >= 5.0:
+                    log.info("...waiting for a stable view (source=%s, stable %d/%d frames)",
+                             method or "none", stable, HEADLESS_STABLE_FRAMES)
+                    last_progress = now
                 if config_data is not None and stable >= HEADLESS_STABLE_FRAMES:
                     save_config(config_data, config_output)
                     break

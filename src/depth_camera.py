@@ -87,10 +87,17 @@ class DepthCamera:
         if self._pipeline is None:
             raise DepthCameraError("camera not started; call start() first")
 
-        frames = self._pipeline.wait_for_frames(self.timeout_ms)
-        if frames is None:
+        # A transient SDK hiccup (USB glitch, dropped frame) must not escape as
+        # a raw OBError and kill the loop — treat it like "no frame this cycle";
+        # the stall watchdog in main.py escalates if it never recovers.
+        try:
+            frames = self._pipeline.wait_for_frames(self.timeout_ms)
+            if frames is None:
+                return None
+            depth_frame = frames.get_depth_frame()
+        except Exception as e:
+            log.warning("Depth read failed (%s) — skipping frame.", e)
             return None
-        depth_frame = frames.get_depth_frame()
         if depth_frame is None:
             return None
 
@@ -111,7 +118,8 @@ class DepthCamera:
                 self._scale = 1.0
             log.info("Depth scale: %.4f (raw unit -> mm)", self._scale)
         if abs(self._scale - 1.0) > 1e-3:
-            depth = (depth.astype(np.float32) * self._scale)
+            # Back to integer millimetres — keeps the documented uint16 contract.
+            depth = (depth.astype(np.float32) * self._scale + 0.5).astype(np.uint16)
         return depth
 
     def stop(self):
@@ -131,30 +139,76 @@ class VideoDepthCamera:
 
         FloorPiano(config, camera=VideoDepthCamera("clip.mp4"))
 
-    A normal video carries no real depth, so every frame is converted to
-    grayscale and its brightness mapped linearly onto a millimetre depth range.
-    By DEFAULT a dark object is treated as "closer" (a foot dipping toward the
-    camera) and bright pixels as the floor — tune ``floor_depth`` / ``near_depth``
-    / ``invert`` until your clip actually triggers the keys.
+    Two ways to turn an ordinary (depth-less) clip into depth-like frames:
+
+    * brightness mode (default): each frame is converted to grayscale and its
+      brightness mapped linearly onto a millimetre range. A dark object is
+      treated as "closer" (a foot) and bright pixels as the floor — tune
+      ``floor_depth`` / ``near_depth`` / ``invert``. Simple, but it cannot tell a
+      real foot from a dark *painted* key.
+    * motion mode (``motion=True``): pixels that differ from a fixed MEDIAN
+      background (sampled across the whole clip in ``start()``) are the foot
+      and become "close"; everything else is floor. A fixed background — unlike
+      a running MOG2 subtractor — never absorbs a foot that stands still on a
+      key (which would release + retrigger the note) and leaves no "ghost"
+      foreground behind when the foot moves away.
+
+    After every ``read_depth()`` the (rotated) colour frame is kept in
+    ``last_bgr`` and the median background in ``background`` — demo_video.py
+    uses them for the visual overlay and the mat auto-calibration.
 
     cv2 is imported lazily inside ``start()`` so importing this module stays
     cheap and dependency-free, consistent with the rest of the file.
     """
 
+    BG_SAMPLES = 25  # frames sampled across the clip for the median background
+
     def __init__(self, path, floor_depth=None, near_depth=None,
-                 invert=False, loop=False):
+                 invert=False, loop=False, rotate=0, motion=False,
+                 motion_min_area=0.003, motion_threshold=35,
+                 trigger_threshold=constants.DEFAULT_TRIGGER_THRESHOLD):
         self.path = path
         self.floor_depth = int(floor_depth) if floor_depth is not None \
             else constants.DEFAULT_FLOOR_DEPTH
-        # Map the brightest/darkest pixel comfortably above the trigger plane so a
-        # full-intensity "foot" fires by default (floor - 200mm, like sweep_frames).
-        self.near_depth = int(near_depth) if near_depth is not None \
-            else max(1, self.floor_depth - 200)
+        trigger_threshold = int(trigger_threshold)
+        if near_depth is not None:
+            self.near_depth = int(near_depth)
+            if self.near_depth < 1:
+                raise ValueError(
+                    f"near_depth must be >= 1mm (0 is the 'no reading' sentinel), "
+                    f"got {self.near_depth}"
+                )
+        elif motion:
+            # Binary mode: put the "foot" comfortably above the trigger plane.
+            self.near_depth = max(1, self.floor_depth - 200)
+        else:
+            # Brightness mode maps gray 0..255 linearly onto near..floor, so the
+            # trigger plane sits at gray = 255 * (1 - threshold/span). Pick the
+            # span so only the darkest quarter (gray < 64) counts as a foot —
+            # with the old floor-200 default the cutoff was gray < 191 and ~3/4
+            # of a normal frame "triggered".
+            span = round(trigger_threshold * 255.0 / (255 - 64))
+            self.near_depth = max(1, self.floor_depth - span)
+        if self.near_depth >= self.floor_depth - trigger_threshold:
+            raise ValueError(
+                f"near_depth ({self.near_depth}mm) must be below the trigger plane "
+                f"(floor {self.floor_depth} - threshold {trigger_threshold} = "
+                f"{self.floor_depth - trigger_threshold}mm), or nothing can ever trigger"
+            )
         self.invert = bool(invert)
         self.loop = bool(loop)
+        if rotate not in (0, 90, 180, 270):
+            raise ValueError("rotate must be one of 0, 90, 180, 270")
+        self.rotate = rotate
+        self.motion = bool(motion)
+        self.motion_min_area = float(motion_min_area)  # min blob area, fraction of frame
+        self.motion_threshold = int(motion_threshold)  # min per-channel diff vs background
         self._cap = None
         self.width = None
         self.height = None
+        self.fps = None
+        self.background = None  # median BGR background (set in start(), seekable files)
+        self.last_bgr = None    # the rotated colour frame behind the last read_depth()
 
     def start(self):
         import cv2
@@ -167,10 +221,43 @@ class VideoDepthCamera:
                 f"could not open video '{self.path}' — is it a readable mp4? "
                 "OpenCV needs the right codecs (try `pip install opencv-contrib-python`)."
             )
-        self.width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        log.info("Video source opened: %s (%dx%d)", self.path, self.width, self.height)
+        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # A 90/270 rotation swaps the reported frame dimensions.
+        self.width, self.height = (h, w) if self.rotate in (90, 270) else (w, h)
+        self.fps = self._cap.get(cv2.CAP_PROP_FPS) or 0.0
+        self._compute_background(cv2)
+        if self.motion and self.background is None:
+            raise DepthCameraError(
+                "motion mode needs a seekable video file to build the median "
+                f"background, but '{self.path}' reports no frame count."
+            )
+        log.info("Video source opened: %s (%dx%d @ %.1f fps, rotate=%d, mode=%s)",
+                 self.path, self.width, self.height, self.fps, self.rotate,
+                 "motion" if self.motion else "brightness")
         return self
+
+    def _compute_background(self, cv2):
+        """Median over frames sampled across the clip = the scene without the foot."""
+        n = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if n <= 0:
+            return
+        samples = []
+        for fidx in np.linspace(0, n - 1, min(self.BG_SAMPLES, n)).astype(int):
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
+            ok, frame = self._cap.read()
+            if ok:
+                samples.append(self._rotated(frame, cv2))
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        if samples:
+            self.background = np.median(np.stack(samples), axis=0).astype(np.uint8)
+
+    def _rotated(self, frame, cv2):
+        if not self.rotate:
+            return frame
+        rot = {90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+               270: cv2.ROTATE_90_COUNTERCLOCKWISE}[self.rotate]
+        return cv2.rotate(frame, rot)
 
     def read_depth(self):
         """Return the next frame as an HxW uint16 depth-like array, or None at EOF."""
@@ -187,6 +274,12 @@ class VideoDepthCamera:
             if not ok:
                 return None
 
+        frame = self._rotated(frame, cv2)
+        self.last_bgr = frame
+
+        if self.motion:
+            return self._motion_depth(frame, cv2)
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
         if self.invert:
             gray = 255.0 - gray
@@ -194,6 +287,35 @@ class VideoDepthCamera:
         span = self.floor_depth - self.near_depth
         depth = self.near_depth + (gray / 255.0) * span
         return depth.astype(np.uint16)
+
+    def _motion_depth(self, frame, cv2):
+        """Pixels differing from the median background -> near_depth; rest -> floor.
+
+        Filtering chain to isolate a clean foot blob from a noisy RGB clip:
+          1. per-channel absdiff vs the fixed background, max over channels
+             (a coloured shoe on the white mat stands out in SOME channel);
+          2. threshold -> raw foreground mask;
+          3. open (remove specks) then close (fill the foot solid);
+          4. keep only connected components above ``motion_min_area`` of the
+             frame, dropping stray noise blobs that aren't a foot.
+        """
+        diff = cv2.absdiff(frame, self.background).max(axis=2)
+        fg = (diff > self.motion_threshold).astype(np.uint8) * 255
+        kernel = np.ones((5, 5), np.uint8)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # Keep only blobs big enough to be a foot (area as a fraction of the frame).
+        min_area = self.motion_min_area * frame.shape[0] * frame.shape[1]
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+        keep = np.zeros(fg.shape, dtype=bool)
+        for i in range(1, n):  # 0 is background
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                keep |= labels == i
+
+        depth = np.full(frame.shape[:2], self.floor_depth, dtype=np.uint16)
+        depth[keep] = self.near_depth
+        return depth
 
     def stop(self):
         if self._cap is not None:

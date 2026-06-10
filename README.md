@@ -6,9 +6,16 @@ Interactive floor piano system for a Raspberry Pi 5 + Orbbec Astra Pro (3D depth
 
 - **24-Key Keyboard**: 2 full octaves — 14 white + 10 black keys (C4–B5), with a real
   piano layout (black keys narrower, at the back, none between E–F or B–C)
-- **3D Depth Triggering**: Low-latency foot detection using Orbbec Astra Pro depth sensing
-- **ArUco Calibration**: Automatic corner detection via printed markers
-- **Low-Latency Audio**: PyGame audio engine with per-note samples
+- **3D Depth Triggering**: Low-latency foot detection using Orbbec Astra Pro depth sensing,
+  restricted to a press-height band so bodies passing OVER the mat stay silent
+- **Blob Detection**: one foot presses exactly one key (majority overlap + boundary
+  hysteresis) — no double notes on key edges, while two feet still play chords;
+  releases are debounced so noise can't retrigger held notes
+- **Calibration without markers**: ArUco markers *or* the printed mat itself — corners,
+  orientation and a sub-pixel grid refinement are derived from the painted keys
+  (verified against real video to ±0.5 px)
+- **Low-Latency Audio**: PyGame audio engine with per-note samples (32 mixer channels,
+  recovers automatically when the USB soundcard comes up late)
 - **Auto-Leveling**: Floor depth sampled (median) at calibration, re-levelable live (RANSAC plane-fit planned — see VERSION_2_PLAN)
 
 ## 📁 Project Structure

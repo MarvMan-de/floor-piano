@@ -49,7 +49,9 @@ You can verify almost everything except the camera itself, in this order:
    ```bash
    pip install -r requirements-dev.txt && pytest
    ```
-   Detection, geometry, keyboard layout, decode and config logic — 69 tests.
+   Detection (blob assignment, debounce, press-height band), geometry, keyboard
+   layout, mat auto-calibration, the full FloorPiano pipeline with injected
+   camera/audio, decode and config logic — 108 tests.
 2. **Samples (stdlib only):**
    ```bash
    python3 src/sounds/generate_samples.py
@@ -64,14 +66,19 @@ You can verify almost everything except the camera itself, in this order:
    python3 src/demo_mock.py
    ```
    To test against a **recorded video instead of a synthetic sweep**, feed it an
-   MP4 — each frame is turned into a depth-like image (brightness → millimetres,
-   dark = close by default). Tune with `--invert` / `--floor` / `--near` until
-   your clip triggers; add `--show` for the detection view, `--no-audio` to run
-   without pygame:
+   MP4 of the mat. Use `--motion` for a normal phone clip: the foot is whatever
+   differs from the median background. The key grid is **auto-calibrated from
+   the mat itself** (corners, orientation — portrait/upside-down/mirrored clips
+   all work — and a sub-pixel refinement onto the painted keys). Add `--show`
+   for the live detection view, `--out result.mp4` to save it, `--no-audio` to
+   run without pygame:
    ```bash
-   python3 src/demo_video.py clip.mp4
-   python3 src/demo_video.py clip.mp4 --invert --loop --show
+   python3 src/demo_video.py clip.mp4 --motion --show
+   python3 src/demo_video.py clip.mp4 --motion --no-audio --out result.mp4
    ```
+   (The default brightness mode — gray value → millimetres — is only for clips
+   that actually encode depth; `--corners` / `--full-frame` override the
+   auto-calibration if needed.)
 5. **Print the markers (cv2):** prepare for on-site calibration.
    ```bash
    python3 tools/generate_aruco.py    # writes markers/marker_0..3.png
@@ -95,23 +102,27 @@ The Astra Pro is a structured-light depth camera — mind its physics:
     ArUco marker, so place the markers' centres exactly on the 4 playable-area corners
     (the playable zone ends up inset by ~half a marker — this is expected).
 
-## 📐 Automatic Calibration (ArUco)
+## 📐 Automatic Calibration (ArUco or the mat itself)
 
-Calibration uses **ArUco Markers**. It runs in a GUI window (press `s` to save) or, if no
-display is attached, **headless** — it auto-saves once all 4 markers stay detected for a
-short, stable period.
+Calibration runs in a GUI window (press `s` to save) or, if no display is attached,
+**headless** — it auto-saves once detection stays stable for a short period (and gives
+up with an error after 2 minutes instead of hanging). The floor depth is the median
+over the stable window, with a spread check so someone walking through the scene
+can't poison it. **Keep the mat clear of feet while calibrating.**
 
-1.  **Prepare Markers**: Print 4 ArUco markers from the `DICT_4X4_50` dictionary (IDs 0, 1, 2, 3).
-2.  **Place Markers**: Place them at the 4 corners of your "piano" area on the floor.
-    *   **ID 0**: Top-Left
-    *   **ID 1**: Top-Right
-    *   **ID 2**: Bottom-Right
-    *   **ID 3**: Bottom-Left
-3.  **Run Calibration** (from the repo root):
+Two corner sources (`--source auto|aruco|mat`, default `auto` = ArUco first):
+
+*   **ArUco markers** — print 4 markers from the `DICT_4X4_50` dictionary
+    (IDs 0=Top-Left, 1=Top-Right, 2=Bottom-Right, 3=Bottom-Left) and place their
+    *centres* on the playable-area corners.
+*   **The printed mat itself (no markers needed)** — the mat is detected as the big
+    bright rectangle, its orientation is resolved from the black-key pattern, and the
+    grid is refined onto the painted keys. This is the fallback whenever the markers
+    aren't found, so on site you can simply run:
     ```bash
-    python3 src/calibrate.py
+    python3 src/calibrate.py            # markers optional
+    python3 src/calibrate.py --source mat   # skip ArUco entirely
     ```
-4.  The system will automatically detect the markers, calculate the perspective warp, and sample the floor's depth to establish the "Trigger Zone." Press 's' to save.
 
 ## 🎹 Running the Piano
 
@@ -123,8 +134,18 @@ It runs with a GUI window if a display is attached, otherwise fully headless (lo
 stdout/journald). Both `q`/`r` keys and the visual overlay only apply in GUI mode.
 
 ### Key Features:
-*   **3D Depth Triggering**: Notes are triggered when a foot enters the 50mm (5cm) "active zone" above the floor.
-*   **Auto-Leveling** (GUI): Press `r` to re-sample the floor plane if the camera is bumped or the floor surface changes.
+*   **3D Depth Triggering**: a foot in the 50mm "active zone" above the floor triggers —
+    but only within 250mm of the floor (`max_press_height`), so a foot swinging
+    mid-step or a knee over the mat stays silent.
+*   **One foot = one key**: the above-floor pixels are split into blobs; each blob
+    presses exactly the key it covers most (with boundary hysteresis), so stepping on
+    a key edge can't fire two notes — while two feet still play chords.
+*   **Debounced release**: a key releases only after 3 consecutive empty frames, so
+    depth noise can't machine-gun a held note.
+*   **Auto-Leveling** (GUI): Press `r` to re-sample the floor plane if the camera is
+    bumped (people standing on the mat are masked out of the sample).
+*   **Watchdog**: if the camera stops delivering frames for ~5s the service exits with
+    an error so systemd restarts it.
 *   **Graceful shutdown**: Ctrl-C or `SIGTERM` (`systemctl stop`) stops the camera and audio cleanly.
 
 ## 🔁 Run on Boot (optional, headless)

@@ -70,14 +70,16 @@ def test_sample_floor_depth_returns_median_in_bounds():
     assert d.sample_floor_depth(depth, (50, 50), (100, 100, 3)) == 1000
 
 
-def test_sample_floor_depth_near_edge_returns_default():
+def test_sample_floor_depth_near_edge_returns_none():
+    # No silent default: a wrong floor depth makes the piano dead or constantly
+    # firing, so "couldn't measure" must be explicit (calibrate.py retries).
     depth = np.full((100, 100), 1000, dtype=np.uint16)
-    assert d.sample_floor_depth(depth, (0, 0), (100, 100, 3), default=1234) == 1234
+    assert d.sample_floor_depth(depth, (0, 0), (100, 100, 3)) is None
 
 
-def test_sample_floor_depth_all_invalid_returns_default():
+def test_sample_floor_depth_all_invalid_returns_none():
     depth = np.zeros((100, 100), dtype=np.uint16)
-    assert d.sample_floor_depth(depth, (50, 50), (100, 100, 3), default=777) == 777
+    assert d.sample_floor_depth(depth, (50, 50), (100, 100, 3)) is None
 
 
 # --- build_config ----------------------------------------------------------

@@ -37,8 +37,23 @@ TARGET_HEIGHT = 200
 DEFAULT_FLOOR_DEPTH = 1000        # camera -> floor distance
 DEFAULT_TRIGGER_THRESHOLD = 50    # 5cm safety buffer above the floor
 
+# Only pixels within this many mm ABOVE the floor can press a key. Anything
+# higher (a foot swinging mid-step, a knee, a torso) is ignored instead of
+# firing notes. Overridable per-config as "max_press_height".
+MAX_PRESS_HEIGHT = 250
+
 # A key fires when more than this many of its pixels are above the floor.
+# Interpreted at the SOURCE-frame scale; main.py rescales it to warp-canvas
+# pixels so the sensitivity doesn't change with camera resolution / mount.
 MIN_HIT_PIXELS = 150
+
+# A held key is released only after it has been absent for this many consecutive
+# frames (~100ms at 30fps) — keeps depth noise from re-triggering the note.
+RELEASE_FRAMES = 3
 
 # Weight of the newest sample when re-leveling the floor (exponential moving average).
 FLOOR_EMA_ALPHA = 0.1
+
+# Give up after this many consecutive empty camera reads (~5s at the 100ms
+# timeout) — lets systemd restart the service instead of spinning silently.
+CAMERA_STALL_LIMIT = 50
