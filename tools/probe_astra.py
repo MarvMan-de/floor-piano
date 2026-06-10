@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Phase-0 hardware probe for the Orbbec Astra Pro on the Raspberry Pi 5.
+"""Phase-0 hardware probe for the legacy Orbbec Astra on the Raspberry Pi 5.
 
 Run this the moment the camera is plugged in — BEFORE touching anything else.
-It answers the single question the whole project hinges on: does the Astra Pro
+It answers the single question the whole project hinges on: does the Astra
 deliver a depth frame on this Pi via OpenNI2?
 
     python3 tools/probe_astra.py
 
 It is read-only and safe: it lists the USB device, tries to open the OpenNI2
 depth stream, grabs one frame, and prints a clear PASS / FAIL with the next
-step. Depth is the hard part (OpenNI2); RGB is an ordinary UVC webcam and is
-checked only as a bonus. See docs/ASTRA_PRO_PI5_SETUP.md for the setup that has
-to be in place first (OpenNI2 SDK + `pip install openni`).
+step. Depth is the hard part (OpenNI2). On the original Astra colour also comes
+via OpenNI2, so a V4L2/UVC node may or may not appear — the RGB check is only a
+bonus. See docs/ASTRA_PI5_SETUP.md for the setup that has to be in place first
+(OpenNI2 SDK + `pip install openni`).
 """
 
 import subprocess
@@ -36,7 +37,7 @@ def check_usb():
         print("  OK  Orbbec device(s) found:")
         for ln in hits:
             print(f"        {ln}")
-        print("      (expect TWO nodes: the depth sensor + a separate UVC RGB cam)")
+        print("      (note the full 2bc5:XXXX id — it pins down the exact Astra model)")
         return True
     print(f"  FAIL  no USB device with vendor id {ORBBEC_VID} found.")
     print("        -> check the cable/port (use a USB-A port, not a hub), and")
@@ -51,7 +52,7 @@ def check_depth():
     except ImportError:
         print("  FAIL  the `openni` Python bindings are not installed.")
         print("        -> pip install openni   AND install the Orbbec OpenNI2 SDK")
-        print("           redist (set OPENNI2_REDIST). See docs/ASTRA_PRO_PI5_SETUP.md.")
+        print("           redist (set OPENNI2_REDIST). See docs/ASTRA_PI5_SETUP.md.")
         return False
 
     import os
@@ -113,13 +114,14 @@ def check_rgb():
         ok = cap.isOpened() and cap.read()[0]
         cap.release()
         if ok:
-            print(f"  OK  a camera responds at /dev/video{idx} (likely the Astra Pro RGB).")
+            print(f"  OK  a camera responds at /dev/video{idx} (a UVC colour cam).")
             return
-    print("  ?  no UVC camera responded at video0..3 (check `v4l2-ctl --list-devices`).")
+    print("  ?  no UVC camera at video0..3 — fine: the original Astra serves colour")
+    print("     over OpenNI2, not V4L2, so a UVC node need not exist. Depth is what matters.")
 
 
 def main():
-    print("Astra Pro / Raspberry Pi 5 — Phase-0 probe")
+    print("Orbbec Astra / Raspberry Pi 5 — Phase-0 probe")
     usb = check_usb()
     depth_ok = check_depth()
     check_rgb()
@@ -133,7 +135,7 @@ def main():
     if usb is False:
         print("        Start at step 1: the camera isn't even on the USB bus.")
     else:
-        print("        Work through docs/ASTRA_PRO_PI5_SETUP.md (OpenNI2 install +")
+        print("        Work through docs/ASTRA_PI5_SETUP.md (OpenNI2 install +")
         print("        the troubleshooting section) and re-run this probe.")
     return 1
 

@@ -53,8 +53,8 @@ class DepthCamera:
             profile = self._select_depth_profile(profile_list)
             if profile is None:
                 raise DepthCameraError(
-                    "no depth stream profile available — is this a Legacy Astra Pro "
-                    "(OpenNI2/UVC)? See docs/SETUP.md blocker #1."
+                    "no depth stream profile available — is this a legacy Orbbec Astra "
+                    "(OpenNI2)? Use FLOOR_PIANO_CAMERA=openni2; see docs/ASTRA_PI5_SETUP.md."
                 )
             config.enable_stream(profile)
             self._pipeline.start(config)
@@ -132,11 +132,12 @@ class DepthCamera:
 
 
 class OpenNI2DepthCamera:
-    """DepthCamera-compatible source for the legacy Astra Pro via OpenNI2.
+    """DepthCamera-compatible source for the legacy Orbbec Astra via OpenNI2.
 
-    The Astra Pro's depth sensor is NOT served by pyorbbecsdk (OrbbecSDK v2):
-    it is a legacy OpenNI2 device (depth over OpenNI2, RGB as a *separate* UVC
-    webcam). This backend reads depth through the ``openni`` Python bindings
+    The original Astra's depth sensor is NOT served by pyorbbecsdk (OrbbecSDK
+    v2): it is a legacy OpenNI2 device (depth — and, unlike the Astra Pro, also
+    colour — over OpenNI2). This backend reads depth through the ``openni`` Python
+    bindings
     (``pip install openni``), which wrap ``libOpenNI2.so`` + the Orbbec driver,
     and returns the same HxW uint16 *millimetre* frames as DepthCamera — so
     FloorPiano needs no other change. Select it at runtime:
@@ -146,7 +147,7 @@ class OpenNI2DepthCamera:
     The PIXEL_FORMAT_DEPTH_1_MM video mode makes frame values already
     millimetres (depth scale 1.0), so no per-device scaling is needed.
 
-    NOTE: written WITHOUT the camera attached — see docs/ASTRA_PRO_PI5_SETUP.md.
+    NOTE: written WITHOUT the camera attached — see docs/ASTRA_PI5_SETUP.md.
     The control flow and OpenNI2 calls follow the documented bindings, but the
     resolution/fps the device actually advertises and the exact buffer layout
     can only be confirmed on real hardware (marked TODO below). Everything that
@@ -154,7 +155,7 @@ class OpenNI2DepthCamera:
     """
 
     def __init__(self, width=640, height=480, fps=30):
-        # 640x480@30 is the Astra Pro's standard depth mode; set_video_mode is
+        # 640x480@30 is the Astra's standard depth mode; set_video_mode is
         # best-effort below, so a device that only offers its default mode still
         # works. TODO(hardware): confirm the advertised mode list.
         self.width = width
@@ -171,7 +172,7 @@ class OpenNI2DepthCamera:
             raise DepthCameraError(
                 "openni bindings not installed. Run 'pip install openni' AND install "
                 "the Orbbec OpenNI2 SDK redist (point OPENNI2_REDIST at it). "
-                "See docs/ASTRA_PRO_PI5_SETUP.md."
+                "See docs/ASTRA_PI5_SETUP.md."
             ) from e
 
         # OPENNI2_REDIST points initialize() at libOpenNI2.so + the Orbbec driver.
@@ -195,12 +196,11 @@ class OpenNI2DepthCamera:
         except Exception as e:
             self.stop()
             raise DepthCameraError(
-                f"failed to start Astra Pro depth via OpenNI2: {e}. If this is a "
-                "'USB endpoint not found' error, see the troubleshooting section in "
-                "docs/ASTRA_PRO_PI5_SETUP.md (known ARM64 SDK issue)."
+                f"failed to start Astra depth via OpenNI2: {e}. See the "
+                "troubleshooting section in docs/ASTRA_PI5_SETUP.md."
             ) from e
 
-        log.info("Astra Pro depth stream started via OpenNI2.")
+        log.info("Astra depth stream started via OpenNI2.")
         return self
 
     def read_depth(self):
@@ -474,8 +474,8 @@ def make_depth_camera():
     """Return the depth source selected by the FLOOR_PIANO_CAMERA env var.
 
     Default 'orbbec' (pyorbbecsdk — Astra 2 / Femto / Gemini). Set
-    FLOOR_PIANO_CAMERA=openni2 for the legacy Astra Pro, which pyorbbecsdk does
-    NOT serve (see docs/ASTRA_PRO_PI5_SETUP.md). Keeps the backend choice out of
+    FLOOR_PIANO_CAMERA=openni2 for the legacy Orbbec Astra, which pyorbbecsdk does
+    NOT serve (see docs/ASTRA_PI5_SETUP.md). Keeps the backend choice out of
     main.py so swapping cameras is one env var, no code change.
     """
     backend = os.environ.get("FLOOR_PIANO_CAMERA", "orbbec").strip().lower()
