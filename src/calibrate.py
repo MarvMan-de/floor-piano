@@ -28,6 +28,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import constants
 import mat_calibration
+import placement
 from depth_camera import DepthCamera, DepthCameraError
 from detection import build_config, sample_floor_depth, validate_config
 
@@ -92,6 +93,23 @@ def save_config(config_data, path):
     log.info("Calibration saved to %s (floor_depth=%dmm).", path, config_data["floor_depth"])
 
 
+def write_placement_status(path, status, stable, needed):
+    """Persist the live placement verdict for the Pi-hotspot web UI to poll.
+
+    Best-effort: a write failure must never interrupt calibration. The web UI
+    (built separately) reads this JSON; it can also import placement.assess_placement
+    directly. See src/placement.py for the field contract.
+    """
+    data = placement.status_to_dict(status)
+    data["stable_frames"] = stable
+    data["needed_frames"] = needed
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
 def _annotate(rgb, corners, floor_depth, method):
     pts = corners.astype(int)
     cv2.polylines(rgb, [pts], True, (0, 255, 0), 2)
@@ -120,6 +138,7 @@ def main(argv=None):
     args = parse_args(argv)
     script_dir = os.path.dirname(os.path.abspath(__file__))
     config_output = os.path.join(script_dir, "config.json")
+    status_output = os.path.join(script_dir, "placement_status.json")
     headless = not os.environ.get('DISPLAY')  # unset OR empty -> headless
 
     camera = DepthCamera()
@@ -154,6 +173,7 @@ def main(argv=None):
     floor_samples = []
     started = time.monotonic()
     last_progress = started
+    last_status_write = 0.0
     rgb_fail = 0
     try:
         while True:
@@ -216,15 +236,25 @@ def main(argv=None):
                         _annotate(rgb, corners, floor_depth, method)
             else:
                 stable, floor_samples = 0, []
-                if not headless:
-                    cv2.putText(rgb, "Searching for ArUco markers / the mat...",
-                                (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+            # Live placement verdict (pure geometry) — drives the headless coach
+            # log, the GUI overlay, and the web-UI status file from one source.
+            status = placement.assess_placement(
+                corners, rgb.shape, depth_ok=floor_depth is not None)
+            now = time.monotonic()
+            if now - last_status_write >= 0.3:
+                write_placement_status(status_output, status, stable, HEADLESS_STABLE_FRAMES)
+                last_status_write = now
+            if not headless:
+                cv2.putText(rgb, status.headline, (20, rgb.shape[0] - 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                cv2.putText(rgb, status.hint, (20, rgb.shape[0] - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             if headless:
-                now = time.monotonic()
                 if now - last_progress >= 5.0:
-                    log.info("...waiting for a stable view (source=%s, stable %d/%d frames)",
-                             method or "none", stable, HEADLESS_STABLE_FRAMES)
+                    log.info("[placement] %s — %s (stable %d/%d)", status.headline,
+                             status.hint, stable, HEADLESS_STABLE_FRAMES)
                     last_progress = now
                 if config_data is not None and stable >= HEADLESS_STABLE_FRAMES:
                     save_config(config_data, config_output)
