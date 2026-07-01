@@ -49,6 +49,7 @@
             <g id="tiles-layer"></g>
             <g id="suggestions-layer"></g>
             <g id="handles-layer"></g>
+            <g id="corners-layer"></g>
             <polyline id="draw-preview" fill="none" stroke="#fff"
                       stroke-width="1.5" stroke-dasharray="6 3"
                       pointer-events="none" />
@@ -98,8 +99,9 @@
     <!-- Right panel: actions + tile properties -->
     <aside id="props-panel">
       <div class="props-actions">
+        <button id="btn-place-corners" class="primary">&#9633; Mat-Ecken setzen</button>
+        <button id="btn-autodetect">&#x26B2; Auto-Ecken</button>
         <button id="btn-add-draw">+ Draw Tile</button>
-        <button id="btn-autodetect">&#x26B2; Autodetect</button>
       </div>
       <h2>Properties</h2>
       <div id="props-form">

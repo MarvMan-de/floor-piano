@@ -7,6 +7,7 @@ Run:
 """
 
 import asyncio
+import logging
 import queue
 import sys
 import time
@@ -19,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from webui.autodetect import detect_tiles
+from webui.autodetect import detect_corners, detect_tiles, tiles_from_corners
 from webui.camera_source import MediaSource
 from webui.tile_store import default_tiles_doc, load_tiles, save_tiles, validate_tiles_doc
 from webui.video_detect import detect_tile_hits
@@ -33,20 +34,36 @@ app = FastAPI(title="Floor Piano WebUI")
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
-@app.middleware("http")
-async def _no_cache_static(request: Request, call_next):
-    """Force revalidation of the UI assets.
+class _NoCacheStatic:
+    """Pure-ASGI middleware: mark the UI assets no-cache so the browser revalidates.
 
-    Starlette's StaticFiles/FileResponse don't emit a Cache-Control header, so
-    browsers fall back to *heuristic* caching and can serve a stale app.js /
-    style.css after an edit without ever revalidating. Marking the UI assets
-    no-cache makes the browser always check for a newer version.
+    Deliberately NOT a BaseHTTPMiddleware: that kind iterates the response body,
+    which buffers/breaks the infinite /video_feed MJPEG stream and floods the log
+    with CancelledError tracebacks on shutdown. This only rewrites the
+    response-start headers for "/" and "/static/*" and leaves streaming responses
+    completely untouched.
     """
-    response = await call_next(request)
-    path = request.url.path
-    if path == "/" or path.startswith("/static/"):
-        response.headers["Cache-Control"] = "no-cache, must-revalidate"
-    return response
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not (path == "/" or path.startswith("/static/")):
+            return await self.app(scope, receive, send)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = [h for h in message.get("headers", [])
+                           if h[0].lower() != b"cache-control"]
+                headers.append((b"cache-control", b"no-cache, must-revalidate"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+app.add_middleware(_NoCacheStatic)
 
 # In-memory tile cache — updated on POST /api/config and on startup
 _tile_cache: dict[str, Any] = default_tiles_doc()
@@ -183,13 +200,44 @@ async def get_frame() -> StreamingResponse:
 
 @app.post("/api/autodetect")
 async def autodetect() -> JSONResponse:
-    """Grab current frame and run contour-based tile detection."""
+    """Grab current frame and auto-detect the mat -> per-key tile suggestions."""
     loop = asyncio.get_event_loop()
     frame = await loop.run_in_executor(None, _media.read_frame if _media else lambda: None)
     if frame is None:
         raise HTTPException(status_code=503, detail="Camera not ready")
     suggestions = detect_tiles(frame)
     return JSONResponse({"suggestions": suggestions})
+
+
+@app.post("/api/detect_corners")
+async def detect_corners_api() -> JSONResponse:
+    """Best-effort auto-detect of the mat's 4 corners (a starting point the user
+    then drags). Returns {"corners": [[x,y]x4]} or {"corners": null}."""
+    loop = asyncio.get_event_loop()
+    frame = await loop.run_in_executor(None, _media.read_frame if _media else lambda: None)
+    if frame is None:
+        raise HTTPException(status_code=503, detail="Camera not ready")
+    corners = detect_corners(frame)
+    return JSONResponse({"corners": corners})
+
+
+@app.post("/api/generate_tiles")
+async def generate_tiles(request: Request) -> JSONResponse:
+    """Project the 24 piano keys onto a user-provided 4-corner mat quad.
+
+    Body: {"corners": [[x,y]x4] in TL,TR,BR,BL, "num_white"?: int}.
+    This is the reliable path: the human places/drags the corners, the keys
+    follow perspective-correctly. Returns {"tiles": [{polygon,label,note}, ...]}.
+    """
+    body = await request.json()
+    corners = body.get("corners")
+    if not isinstance(corners, list) or len(corners) != 4:
+        raise HTTPException(status_code=422, detail="corners must be 4 [x, y] points")
+    try:
+        tiles = tiles_from_corners(corners, body.get("num_white"))
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return JSONResponse({"tiles": tiles})
 
 
 # ---------------------------------------------------------------------------
@@ -204,26 +252,28 @@ async def get_sources() -> JSONResponse:
         for ext in _VIDEO_EXTS:
             for p in sorted(_DEMO_DIR.glob(ext)):
                 videos.append(str(p.relative_to(_REPO_ROOT)))
-    return JSONResponse({"cameras": [0], "videos": videos})
+    return JSONResponse({"depth_camera": True, "cameras": [0], "videos": videos})
 
 
 @app.post("/api/source")
 async def set_source(request: Request) -> JSONResponse:
-    """Switch the active source: {"type":"camera"} or {"type":"video","path":"demo/foo.mp4"}."""
+    """Switch the active source: {"type":"orbbec"|"camera"|"video","path":"demo/foo.mp4"}."""
     if _media is None:
         raise HTTPException(status_code=503, detail="Media source not ready")
     body = await request.json()
     src_type = body.get("type")
-    if src_type not in ("camera", "video"):
-        raise HTTPException(status_code=422, detail="type must be 'camera' or 'video'")
-    path = body.get("path") if src_type == "video" else None
+    if src_type not in ("orbbec", "camera", "video"):
+        raise HTTPException(status_code=422, detail="type must be 'orbbec', 'camera' or 'video'")
     if src_type == "video":
+        path = body.get("path")
         if not path:
             raise HTTPException(status_code=422, detail="path required for video source")
         full_path = _REPO_ROOT / path
         if not full_path.exists():
             raise HTTPException(status_code=404, detail=f"Video not found: {path}")
         _media.switch_source("video", path=str(full_path))
+    elif src_type == "orbbec":
+        _media.switch_source("orbbec")
     else:
         camera_index = body.get("camera_index", 0)
         _media.switch_source("camera", camera_index=int(camera_index))
@@ -300,55 +350,51 @@ async def get_triggers() -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 @app.get("/video_feed")
-async def video_feed() -> StreamingResponse:
+async def video_feed(request: Request) -> StreamingResponse:
     return StreamingResponse(
-        _frame_generator(),
+        _frame_generator(request),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-def _hex_to_bgr(hex_color: str) -> tuple:
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return (b, g, r)
-
-
-def _frame_generator() -> Generator[bytes, None, None]:
+async def _frame_generator(request: Request):
     boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
     while True:
+        # Stop cleanly when the browser disconnects or the server shuts down,
+        # instead of hanging in an await and raising CancelledError on Ctrl-C.
+        if await request.is_disconnected():
+            break
+
         frame = _media.read_frame() if _media else None
         if frame is None:
-            time.sleep(0.067)
+            await asyncio.sleep(0.067)
             continue
 
-        frame = frame.copy()
-        tiles = _tile_cache.get("tiles", [])
-
-        for tile in tiles:
-            if not tile.get("enabled", True):
-                continue
-            poly = tile.get("polygon", [])
-            if len(poly) < 3:
-                continue
-            pts = np.array(poly, dtype=np.int32)
-            color = _hex_to_bgr(tile.get("color", "#4A90D9"))
-            cv2.polylines(frame, [pts], isClosed=True, color=color, thickness=2)
-            cx = int(pts[:, 0].mean())
-            cy = int(pts[:, 1].mean())
-            label = tile.get("label", "")
-            cv2.putText(frame, label, (cx - 12, cy + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
+        # NOTE: tiles are drawn client-side by the SVG overlay (app.js). We must
+        # NOT also burn them into the stream here — otherwise every tile appears
+        # twice, and offset whenever the frame size differs from the overlay's
+        # 640x480 coordinate space (this was the "doubled tiles after save" bug).
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if ok:
             yield boundary + buf.tobytes() + b"\r\n"
 
-        time.sleep(0.067)  # ~15 FPS cap
+        await asyncio.sleep(0.067)  # ~15 FPS cap
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+class _DropCancelledError(logging.Filter):
+    """Silence the benign CancelledError traceback uvicorn logs when an active
+    /video_feed stream is aborted on Ctrl-C. The server still shuts down cleanly;
+    this only stops the scary (but harmless) traceback. CancelledError is never a
+    real, user-actionable error here."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        return not isinstance(exc, asyncio.CancelledError)
+
 
 if __name__ == "__main__":
     import argparse
@@ -359,6 +405,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--camera-index", type=int, default=0)
     args = parser.parse_args()
+
+    logging.getLogger("uvicorn.error").addFilter(_DropCancelledError())
 
     _tile_cache["camera_index"] = args.camera_index
     uvicorn.run(app, host=args.host, port=args.port)

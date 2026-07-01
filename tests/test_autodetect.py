@@ -1,108 +1,81 @@
-"""Tests for webui/autodetect.py — hardware-free, uses synthetic numpy frames."""
+"""Tests for webui/autodetect.py — hardware-free, synthetic numpy frames.
+
+The autodetect was reworked to reuse the project's mat calibration + keyboard
+geometry: the 4 mat corners drive a perspective projection of the known 24-key
+grid. These tests cover that projection (the reliable path) and the best-effort
+corner auto-detection.
+"""
 import numpy as np
-import cv2
 import pytest
 
-from webui.autodetect import detect_tiles
+from webui.autodetect import (_content_roi, detect_corners, detect_tiles,
+                              tiles_from_corners)
 from webui.tile_store import NOTE_NAMES
 
 
-def _blank_frame(w=640, h=480):
+def _blank(w=640, h=480):
     return np.zeros((h, w, 3), dtype=np.uint8)
 
 
-def _frame_with_rect(x, y, w, h, frame_w=640, frame_h=480, rect_color=255):
-    """White-filled rectangle on a black background."""
-    frame = _blank_frame(frame_w, frame_h)
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (rect_color, rect_color, rect_color), -1)
-    return frame
+# ── tiles_from_corners: the reliable path ──────────────────────────────────
+
+def test_projects_full_24_key_grid():
+    tiles = tiles_from_corners([[100, 60], [560, 60], [560, 300], [100, 300]])
+    assert len(tiles) == 24
+    for t in tiles:
+        assert t["note"] in NOTE_NAMES
+        assert t["label"] in NOTE_NAMES
+        assert len(t["polygon"]) == 4
+        for x, y in t["polygon"]:
+            assert isinstance(x, int) and isinstance(y, int)
 
 
-# ── Basic detection ───────────────────────────────────────────────────────
-
-def test_detects_single_rectangle():
-    frame = _frame_with_rect(100, 100, 200, 150)
-    results = detect_tiles(frame, min_area_px=1000)
-    assert len(results) >= 1
-
-
-def test_returns_polygon_with_at_least_3_points():
-    frame = _frame_with_rect(100, 100, 200, 150)
-    results = detect_tiles(frame, min_area_px=1000)
-    for r in results:
-        assert len(r["polygon"]) >= 3
+def test_axis_aligned_corners_give_axis_aligned_keys():
+    tiles = tiles_from_corners([[0, 0], [640, 0], [640, 480], [0, 480]])
+    # First white key hugs the left edge, full height.
+    poly = tiles[0]["polygon"]
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    assert min(xs) == 0 and min(ys) == 0 and max(ys) == 480
 
 
-def test_assigns_note_names():
-    frame = _frame_with_rect(100, 100, 200, 150)
-    results = detect_tiles(frame, min_area_px=1000)
-    for r in results:
-        assert r["note"] in NOTE_NAMES
-        assert r["label"] in NOTE_NAMES
+def test_tilted_corners_give_perspective_trapezoids():
+    # Keystone: top edge narrower than bottom -> keys must be trapezoids.
+    tiles = tiles_from_corners([[200, 80], [440, 80], [560, 300], [80, 300]])
+    p = tiles[0]["polygon"]  # C4, leftmost white key
+    top = ((p[0][0] - p[1][0]) ** 2 + (p[0][1] - p[1][1]) ** 2) ** 0.5
+    bottom = ((p[3][0] - p[2][0]) ** 2 + (p[3][1] - p[2][1]) ** 2) ** 0.5
+    assert bottom > top * 1.3  # clearly foreshortened at the top
 
 
-# ── Filtering ─────────────────────────────────────────────────────────────
-
-def test_filters_small_area():
-    # Tiny 10×10 rect — well below the default 2000 px² threshold
-    frame = _frame_with_rect(50, 50, 10, 10)
-    results = detect_tiles(frame, min_area_px=2000)
-    assert len(results) == 0
+def test_has_white_and_black_keys():
+    tiles = tiles_from_corners([[100, 60], [560, 60], [560, 300], [100, 300]])
+    notes = [t["note"] for t in tiles]
+    assert "C4" in notes and "C#4" in notes and "B5" in notes
+    assert sum("#" in n for n in notes) == 10  # 10 black keys
 
 
-def test_filters_border_touching_contour():
-    # Rectangle starting at x=0 touches the left border
-    frame = _frame_with_rect(0, 50, 200, 150)
-    results = detect_tiles(frame, min_area_px=1000)
-    assert len(results) == 0
+@pytest.mark.parametrize("bad", [[[0, 0]], [[0, 0], [1, 1], [2, 2]], []])
+def test_rejects_wrong_corner_count(bad):
+    with pytest.raises((ValueError, TypeError)):
+        tiles_from_corners(bad)
 
 
-def test_interior_rect_not_filtered():
-    # Rectangle well away from the border should survive
-    frame = _frame_with_rect(100, 100, 200, 150)
-    results = detect_tiles(frame, min_area_px=1000)
-    assert len(results) >= 1
+# ── auto-detection: graceful on a mat-less frame ───────────────────────────
+
+def test_detect_corners_none_on_blank():
+    assert detect_corners(_blank()) is None
 
 
-# ── Sorting & note assignment ─────────────────────────────────────────────
-
-def test_assigns_note_names_left_to_right():
-    """Two rects side by side: left one should get the lower note."""
-    frame = _blank_frame()
-    # Left rect
-    cv2.rectangle(frame, (50, 100), (200, 300), (255, 255, 255), -1)
-    # Right rect
-    cv2.rectangle(frame, (300, 100), (500, 300), (255, 255, 255), -1)
-    results = detect_tiles(frame, min_area_px=1000)
-    if len(results) >= 2:
-        left_note_idx  = NOTE_NAMES.index(results[0]["note"])
-        right_note_idx = NOTE_NAMES.index(results[1]["note"])
-        assert left_note_idx < right_note_idx
+def test_detect_tiles_empty_on_blank():
+    assert detect_tiles(_blank()) == []
 
 
-def test_caps_at_24_tiles():
-    """Even if we have many contours, never return more than 24."""
-    frame = _blank_frame(1280, 960)
-    # Draw a 5x5 grid of small rects, each large enough to pass area filter
-    for row in range(5):
-        for col in range(5):
-            x = 100 + col * 220
-            y = 100 + row * 170
-            cv2.rectangle(frame, (x, y), (x + 80, y + 60), (255, 255, 255), -1)
-    results = detect_tiles(frame, max_tiles=24, min_area_px=500)
-    assert len(results) <= 24
+# ── letterbox handling ─────────────────────────────────────────────────────
 
-
-def test_empty_frame_returns_no_tiles():
-    frame = _blank_frame()
-    results = detect_tiles(frame)
-    assert results == []
-
-
-def test_result_polygon_points_are_integers():
-    frame = _frame_with_rect(100, 100, 200, 150)
-    results = detect_tiles(frame, min_area_px=1000)
-    for r in results:
-        for pt in r["polygon"]:
-            assert isinstance(pt[0], (int, np.integer))
-            assert isinstance(pt[1], (int, np.integer))
+def test_content_roi_strips_black_bars():
+    frame = _blank()
+    frame[60:420, :] = 200  # content band with 60px black bars top/bottom
+    content, xo, yo = _content_roi(frame)
+    assert yo == 60
+    assert content.shape[0] == 360

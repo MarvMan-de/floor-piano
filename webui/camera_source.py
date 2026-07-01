@@ -9,6 +9,43 @@ import cv2
 import numpy as np
 
 
+def _letterbox(img: np.ndarray, tw: int, th: int) -> np.ndarray:
+    """Fit img into a tw x th frame keeping aspect ratio (black bars, no distortion)."""
+    h, w = img.shape[:2]
+    if w == tw and h == th:
+        return img
+    scale = min(tw / w, th / h)
+    nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+    resized = cv2.resize(img, (nw, nh))
+    canvas = np.zeros((th, tw, 3), dtype=img.dtype)
+    x0, y0 = (tw - nw) // 2, (th - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
+
+
+def _color_to_bgr(color_frame) -> Optional[np.ndarray]:
+    """Decode an Orbbec colour frame into a BGR image, or None on unknown format."""
+    w, h = color_frame.get_width(), color_frame.get_height()
+    name = str(color_frame.get_format()).upper()
+    data = np.frombuffer(color_frame.get_data(), dtype=np.uint8)
+    try:
+        if "MJPG" in name or "MJPEG" in name or "JPEG" in name:
+            return cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if "RGB" in name:
+            return cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+        if "BGR" in name:
+            return data.reshape(h, w, 3)
+        if "YUYV" in name or "YUY2" in name:
+            return cv2.cvtColor(data.reshape(h, w, 2), cv2.COLOR_YUV2BGR_YUYV)
+        if "NV12" in name:
+            return cv2.cvtColor(data.reshape(h * 3 // 2, w), cv2.COLOR_YUV2BGR_NV12)
+        if "I420" in name:
+            return cv2.cvtColor(data.reshape(h * 3 // 2, w), cv2.COLOR_YUV2BGR_I420)
+    except Exception:
+        return None
+    return None
+
+
 class MediaSource:
     """Thread-safe media source: live camera or video-file playback.
 
@@ -22,14 +59,20 @@ class MediaSource:
     callback set by the server after tile config is loaded.
     """
 
-    def __init__(self, camera_index: int = 0, width: int = 640, height: int = 480) -> None:
+    def __init__(self, camera_index: int = 0, width: int = 640, height: int = 480,
+                 source_type: str = "orbbec") -> None:
         self._lock = threading.Lock()
 
         # Current source
-        self._source_type: str = "camera"   # "camera" | "video"
+        self._source_type: str = source_type   # "orbbec" | "camera" | "video"
         self._camera_index: int = camera_index
         self._video_path: Optional[str] = None
         self._cap: Optional[cv2.VideoCapture] = None
+
+        # Orbbec source (pyorbbecsdk): the Gemini's COLOUR stream as a BGR frame,
+        # resized to (width, height). Colour — not depth — so the printed piano
+        # keys are visible for drawing tiles.
+        self._ob: Any = None
 
         # Frame dimensions
         self.width = width
@@ -61,7 +104,13 @@ class MediaSource:
     # ── Public API ────────────────────────────────────────────────────────
 
     def start(self) -> "MediaSource":
-        self._cap = self._open_camera(self._camera_index)
+        if self._source_type == "orbbec":
+            self._ob = self._open_orbbec()
+            if self._ob is None:  # no depth camera / SDK -> fall back to a webcam
+                self._source_type = "camera"
+                self._cap = self._open_camera(self._camera_index)
+        else:
+            self._cap = self._open_camera(self._camera_index)
         self._running = True
         self._thread = threading.Thread(
             target=self._capture_loop, daemon=True, name="media-capture"
@@ -76,6 +125,12 @@ class MediaSource:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+        if self._ob is not None:
+            try:
+                self._ob.stop()
+            except Exception:
+                pass
+            self._ob = None
 
     def read_frame(self) -> Optional[np.ndarray]:
         """Return a copy of the latest BGR frame, or None if not yet available."""
@@ -131,6 +186,56 @@ class MediaSource:
     def _open_video(self, path: str) -> cv2.VideoCapture:
         return cv2.VideoCapture(path)
 
+    def _open_orbbec(self):
+        """Start a pyorbbecsdk COLOUR pipeline (Gemini RGB), or None if unavailable."""
+        try:
+            from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
+        except Exception as e:
+            print(f"[camera_source] pyorbbecsdk not available ({e}) — no Orbbec camera")
+            return None
+        try:
+            pipe = Pipeline()
+            cfg = Config()
+            plist = pipe.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+            prof = None
+            for f in ("MJPG", "RGB"):
+                try:
+                    prof = plist.get_video_stream_profile(0, 0, getattr(OBFormat, f), 0)
+                    if prof:
+                        break
+                except Exception:
+                    pass
+            prof = prof or plist.get_default_video_stream_profile()
+            cfg.enable_stream(prof)
+            pipe.start(cfg)
+            print("[camera_source] Orbbec colour stream started (Gemini RGB)")
+            return pipe
+        except Exception as e:
+            print(f"[camera_source] Orbbec colour start failed ({e})")
+            return None
+
+    def _read_orbbec(self) -> None:
+        """Grab one Gemini colour frame, decode + resize, store as current BGR frame."""
+        if self._ob is None:
+            time.sleep(0.05)
+            return
+        try:
+            frames = self._ob.wait_for_frames(100)
+        except Exception:
+            frames = None
+        if frames is None:
+            return
+        color = frames.get_color_frame()
+        if color is None:
+            return
+        bgr = _color_to_bgr(color)
+        if bgr is None:
+            return
+        # Fit into the frontend's fixed (width, height) space WITHOUT distorting:
+        # aspect-preserving scale + letterbox, so proportions stay true and the
+        # SVG overlay / tiles.json stay in one coordinate system.
+        self._store_frame(_letterbox(bgr, self.width, self.height))
+
     def _apply_pending_source(self) -> bool:
         """Consume _pending_source if set. Returns True if a swap occurred."""
         with self._lock:
@@ -141,6 +246,26 @@ class MediaSource:
 
         if self._cap is not None:
             self._cap.release()
+            self._cap = None
+        if self._ob is not None:
+            try:
+                self._ob.stop()
+            except Exception:
+                pass
+            self._ob = None
+
+        if pending["type"] == "orbbec":
+            self._ob = self._open_orbbec()
+            with self._lock:
+                self._source_type = "orbbec" if self._ob is not None else "camera"
+                self._video_path = None
+                self._playing = True
+                self._fps = 30.0
+                self._total_frames = 0
+                self._current_frame_idx = 0
+            if self._ob is None:
+                self._cap = self._open_camera(self._camera_index)
+            return True
 
         if pending["type"] == "camera":
             self._cap = self._open_camera(pending["camera_index"])
@@ -197,15 +322,19 @@ class MediaSource:
             self._apply_pending_source()
             self._apply_pending_seek(last_video_ts)
 
-            if self._cap is None or not self._cap.isOpened():
-                time.sleep(0.033)
-                continue
-
             with self._lock:
                 mode = self._source_type
                 playing = self._playing
                 speed = self._speed
                 fps = self._fps
+
+            if mode == "orbbec":
+                self._read_orbbec()
+                continue
+
+            if self._cap is None or not self._cap.isOpened():
+                time.sleep(0.033)
+                continue
 
             if mode == "camera":
                 ret, frame = self._cap.read()

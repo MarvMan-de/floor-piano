@@ -32,7 +32,7 @@ const PALETTE = [
 // ── Shared state ──────────────────────────────────────────────────────────
 const state = {
   // Canvas mode
-  mode: "LIVE",        // "LIVE" | "FREEZE" | "DRAW" | "SELECT"
+  mode: "LIVE",        // "LIVE" | "FREEZE" | "DRAW" | "SELECT" | "CORNERS"
   tiles: [],
   selectedId: null,
   drawVertices: [],
@@ -43,6 +43,7 @@ const state = {
   undoStack: [],
   suggestions: [],
   dragState: null,
+  cornerPoints: [],     // 4 mat corners (frame coords) for the corner tool
   frameSize: { w: 640, h: 480 },
   _nextId: 1,
 
@@ -76,6 +77,7 @@ const overlayEl       = document.getElementById("overlay");
 const tilesLayer      = document.getElementById("tiles-layer");
 const suggestLayer    = document.getElementById("suggestions-layer");
 const handlesLayer    = document.getElementById("handles-layer");
+const cornersLayer    = document.getElementById("corners-layer");
 const drawHandlesLayer = document.getElementById("draw-handles-layer");
 const drawPreview     = document.getElementById("draw-preview");
 const cursorLine      = document.getElementById("draw-cursor-line");
@@ -89,6 +91,7 @@ const btnDiscard    = document.getElementById("btn-discard");
 const btnRotate     = document.getElementById("btn-rotate");
 const btnAddDraw    = document.getElementById("btn-add-draw");
 const btnAutodetect = document.getElementById("btn-autodetect");
+const btnPlaceCorners = document.getElementById("btn-place-corners");
 const suggActions   = document.getElementById("suggestion-actions");
 const btnAcceptAll  = document.getElementById("btn-accept-all");
 const btnRejectAll  = document.getElementById("btn-reject-all");
@@ -424,6 +427,11 @@ function setMode(newMode) {
   if (newMode === "DRAW") {
     overlayEl.style.cursor = "crosshair";
     setStatus("Click to add points, click a dot to close");
+  } else if (newMode === "CORNERS") {
+    overlayEl.style.cursor = "crosshair";
+    setStatus(state.cornerPoints.length < 4
+      ? `Ecke ${state.cornerPoints.length + 1}/4 der Matte klicken (Reihenfolge egal)`
+      : "Ecken ziehen zum Feinjustieren, dann Save");
   } else {
     overlayEl.style.cursor = "";
   }
@@ -440,9 +448,36 @@ function setMode(newMode) {
 function renderAll() {
   renderTiles();
   renderHandles();
+  renderCorners();
   renderSuggestions();
   renderSidebar();
   renderPropsPanel();
+}
+
+function renderCorners() {
+  cornersLayer.innerHTML = "";
+  if (state.mode !== "CORNERS") return;
+  const pts = state.cornerPoints;
+  if (pts.length >= 2) {
+    const outline = svgEl(pts.length >= 4 ? "polygon" : "polyline", {
+      points: pts.map(p => p.join(",")).join(" "),
+      fill: "none", stroke: "#00e5ff", "stroke-width": "2",
+      "stroke-dasharray": "6 4", "pointer-events": "none",
+    });
+    cornersLayer.appendChild(outline);
+  }
+  pts.forEach(([x, y], idx) => {
+    const c = svgEl("circle", {
+      cx: x, cy: y, r: "9", fill: "#00e5ff", stroke: "#00303a", "stroke-width": "2",
+    });
+    c.style.cursor = "grab";
+    c.addEventListener("mousedown", e => onCornerMouseDown(e, idx));
+    cornersLayer.appendChild(c);
+    const t = svgEl("text", { x: x + 12, y: y - 10, class: "tile-text",
+                              style: "fill:#00e5ff;font-size:13px" });
+    t.textContent = String(idx + 1);
+    cornersLayer.appendChild(t);
+  });
 }
 
 function renderTiles() {
@@ -639,6 +674,15 @@ function selectTile(id) {
 
 // ── Canvas events ─────────────────────────────────────────────────────────
 function onOverlayClick(e) {
+  if (state.mode === "CORNERS") {
+    if (state.cornerPoints.length < 4) {
+      state.cornerPoints.push(svgPoint(e));
+      renderCorners();
+      if (state.cornerPoints.length === 4) generateTilesFromCorners();
+      else setStatus(`Ecke ${state.cornerPoints.length + 1}/4 der Matte klicken`);
+    }
+    return;
+  }
   if (state.mode === "DRAW") {
     const pt = svgPoint(e);
     state.drawVertices.push(pt);
@@ -681,9 +725,22 @@ function onOverlayMouseMove(e) {
 
 function onOverlayMouseUp() {
   if (state.dragState) {
+    const wasCorner = state.dragState.kind === "corner";
     state.dragState = null;
     renderHandles();
+    if (wasCorner && state.cornerPoints.length === 4) generateTilesFromCorners();
   }
+}
+
+function onCornerMouseDown(e, idx) {
+  if (e.button !== 0) return;
+  e.stopPropagation();
+  state.dragState = {
+    kind: "corner",
+    cornerIdx: idx,
+    startPt: svgPoint(e),
+    orig: [...state.cornerPoints[idx]],
+  };
 }
 
 function onPolyClick(e, tileId) {
@@ -729,6 +786,12 @@ function onDragMove(e) {
   const pt = svgPoint(e);
   const dx = pt[0] - ds.startPt[0];
   const dy = pt[1] - ds.startPt[1];
+  if (ds.kind === "corner") {
+    state.cornerPoints[ds.cornerIdx] = [ds.orig[0] + dx, ds.orig[1] + dy];
+    renderCorners();
+    if (state.cornerPoints.length === 4) scheduleGenerate();  // live-ish snap
+    return;
+  }
   const tile = state.tiles.find(t => t.id === ds.tileId);
   if (!tile) return;
   if (ds.kind === "vertex") {
@@ -829,6 +892,79 @@ function acceptAllSuggestions() {
 function clearSuggestions() {
   state.suggestions = [];
   renderSuggestions();
+}
+
+// ── Mat corner tool (reliable: place 4 corners -> project the 24 keys) ───────
+function enterCornersMode() {
+  if (state.mode === "LIVE") setMode("FREEZE");
+  state.cornerPoints = [];
+  state.suggestions = [];
+  setMode("CORNERS");
+}
+
+async function runAutoCorners() {
+  if (state.mode === "LIVE") setMode("FREEZE");
+  setStatus("Suche Mattenecken…");
+  try {
+    const res = await fetch("/api/detect_corners", { method: "POST" });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    if (!data.corners) {
+      state.cornerPoints = [];
+      setMode("CORNERS");
+      setStatus("Keine Matte erkannt — bitte die 4 Ecken manuell setzen", "err");
+      return;
+    }
+    state.cornerPoints = data.corners.map(p => [Math.round(p[0]), Math.round(p[1])]);
+    setMode("CORNERS");
+    generateTilesFromCorners();
+    setStatus("Ecken vorgeschlagen — auf die echten Mattenecken ziehen, dann Save");
+  } catch (err) {
+    setStatus("Auto-Ecken fehlgeschlagen: " + err.message, "err");
+  }
+}
+
+// Sort 4 points into TL,TR,BR,BL so placement order doesn't matter.
+function orderCorners(pts) {
+  const sum = p => p[0] + p[1];
+  const diff = p => p[0] - p[1];
+  return [
+    pts.reduce((a, b) => (sum(b) < sum(a) ? b : a)),   // TL: smallest x+y
+    pts.reduce((a, b) => (diff(b) > diff(a) ? b : a)),  // TR: largest x-y
+    pts.reduce((a, b) => (sum(b) > sum(a) ? b : a)),    // BR: largest x+y
+    pts.reduce((a, b) => (diff(b) < diff(a) ? b : a)),  // BL: smallest x-y
+  ];
+}
+
+let _genTimer = null;
+function scheduleGenerate() {
+  clearTimeout(_genTimer);
+  _genTimer = setTimeout(generateTilesFromCorners, 120);  // debounce during drag
+}
+
+async function generateTilesFromCorners() {
+  if (state.cornerPoints.length !== 4) return;
+  try {
+    const res = await fetch("/api/generate_tiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ corners: orderCorners(state.cornerPoints) }),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || "generate failed");
+    const data = await res.json();
+    pushUndo();
+    state.tiles = (data.tiles || []).map((t, i) => ({
+      id: state._nextId++,
+      label: t.label, note: t.note, polygon: t.polygon,
+      color: PALETTE[i % PALETTE.length], enabled: true,
+    }));
+    state.dirty = true;
+    state.suggestions = [];
+    renderAll();
+    setStatus(`${state.tiles.length} Tasten projiziert — Ecken justieren, dann Save`);
+  } catch (err) {
+    setStatus("Tasten-Erzeugung fehlgeschlagen: " + err.message, "err");
+  }
 }
 
 // ── Save / discard ────────────────────────────────────────────────────────
@@ -952,7 +1088,8 @@ function bindEvents() {
     h.addEventListener("mousedown", onResizeStart);
     h.addEventListener("dblclick", resetFeedSize);
   });
-  btnAutodetect.addEventListener("click", runAutodetect);
+  if (btnPlaceCorners) btnPlaceCorners.addEventListener("click", enterCornersMode);
+  btnAutodetect.addEventListener("click", runAutoCorners);
   btnAcceptAll.addEventListener("click", acceptAllSuggestions);
   btnRejectAll.addEventListener("click", clearSuggestions);
 
@@ -1026,6 +1163,8 @@ function bindEvents() {
         setMode("FREEZE");
       } else if (state.mode === "SELECT") {
         state.selectedId = null;
+        setMode("FREEZE");
+      } else if (state.mode === "CORNERS") {
         setMode("FREEZE");
       }
     }
