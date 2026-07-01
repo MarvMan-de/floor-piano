@@ -18,7 +18,11 @@ import numpy as np
 # NOT trigger — this is the fix for "the note plays when my hand just passes over".
 DEFAULT_CONTACT_MIN_MM = 5     # ignore depth noise right at the surface plane
 DEFAULT_CONTACT_MAX_MM = 30    # fingertip touching; above this = hovering -> ignore
-DEFAULT_MIN_PIXELS = 20        # min contact pixels inside a tile to fire it
+# A press is a finger-sized connected BLOB, not just loose pixels. This rejects
+# both speckle noise (too small) and a whole tilted/noisy surface drifting into
+# the band (too big) — the "all keys fire at once" bug.
+DEFAULT_MIN_BLOB_PX = 25       # smaller = noise
+DEFAULT_MAX_BLOB_FRAC = 0.10   # a finger can't cover >10% of the frame -> drift/noise
 
 
 def build_tile_label_map(tiles, width, height):
@@ -45,30 +49,45 @@ def build_tile_label_map(tiles, width, height):
 def detect_tile_hits_depth(depth_mm, surface_mm, label_map, tile_ids,
                            contact_min_mm=DEFAULT_CONTACT_MIN_MM,
                            contact_max_mm=DEFAULT_CONTACT_MAX_MM,
-                           min_pixels=DEFAULT_MIN_PIXELS):
-    """Return the set of tile ids currently *touched*.
+                           min_blob_px=DEFAULT_MIN_BLOB_PX,
+                           max_blob_frac=DEFAULT_MAX_BLOB_FRAC):
+    """Return the set of tile ids currently *touched* (blob-based).
 
     ``above = surface - depth`` is how far a pixel sits in front of the captured
-    surface. A **touch** is a pixel in the thin contact band
-    ``contact_min_mm <= above <= contact_max_mm`` — i.e. right at the surface (a
-    fingertip). A hovering / passing hand is much further in front (above >
-    contact_max_mm) and is ignored, so it no longer triggers the note. Per tile,
-    more than ``min_pixels`` contact pixels = pressed.
+    surface. Contact pixels are those in the thin band
+    ``contact_min_mm <= above <= contact_max_mm`` (a fingertip right at the
+    surface). Those pixels are grouped into connected components; only
+    finger-sized blobs (>= min_blob_px and <= max_blob_frac of the frame) count,
+    and each blob fires the ONE tile it covers most. This rejects speckle noise
+    (too small) and a whole tilted/noisy surface drifting into the band (too big
+    → the "all keys fire" bug), and stops a hand smearing across many tiles.
     """
     if surface_mm is None or depth_mm is None:
         return set()
     d = depth_mm.astype(np.int32)
     s = surface_mm.astype(np.int32)
     above = s - d
-    touch = (d > 0) & (s > 0) & (above >= contact_min_mm) & (above <= contact_max_mm)
-    if not touch.any():
+    contact = ((d > 0) & (s > 0) &
+               (above >= contact_min_mm) & (above <= contact_max_mm)).astype(np.uint8)
+    if not contact.any():
         return set()
-    labels = label_map[touch]
-    labels = labels[labels >= 0]
-    if labels.size == 0:
-        return set()
-    counts = np.bincount(labels, minlength=len(tile_ids))
-    return {tile_ids[i] for i in range(len(tile_ids)) if counts[i] > min_pixels}
+    # Drop specks, then fuse a fingertip fragmented by depth holes into one blob.
+    contact = cv2.morphologyEx(contact, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contact = cv2.morphologyEx(contact, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, blobs, stats, _ = cv2.connectedComponentsWithStats(contact, connectivity=8)
+    max_area = max_blob_frac * contact.shape[0] * contact.shape[1]
+    hits = set()
+    for b in range(1, n):  # 0 is background
+        area = stats[b, cv2.CC_STAT_AREA]
+        if area < min_blob_px or area > max_area:
+            continue
+        keys = label_map[blobs == b]
+        keys = keys[keys >= 0]
+        if keys.size == 0:
+            continue
+        counts = np.bincount(keys, minlength=len(tile_ids))
+        hits.add(tile_ids[int(np.argmax(counts))])
+    return hits
 
 
 class DepthHitTracker:

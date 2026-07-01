@@ -41,6 +41,16 @@ def test_hovering_hand_does_not_fire():
     assert detect_tile_hits_depth(depth, surface, lm, ids) == set()
 
 
+def test_whole_surface_in_band_does_not_fire_all():
+    """The 'all keys fire' bug: a tilted/noisy surface drifting into the contact
+    band across the whole frame is one huge blob -> rejected, not every tile."""
+    tiles = [_tile(i, (i - 1) * 60 + 10, 50, (i - 1) * 60 + 60, 150) for i in range(1, 6)]
+    lm, ids = build_tile_label_map(tiles, W, H)
+    surface = np.full((H, W), 1000, np.uint16)
+    depth = np.full((H, W), 985, np.uint16)  # entire frame 15 mm "in front" (drift)
+    assert detect_tile_hits_depth(depth, surface, lm, ids) == set()
+
+
 def test_tilted_surface_contact_fires():
     lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150)], W, H)
     ramp = np.linspace(800, 1200, W).astype(np.uint16)   # tilted surface
