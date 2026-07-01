@@ -81,12 +81,20 @@ def main(argv=None):
     win = "Gemini depth — q/Esc to quit"
     try:
         cv2.namedWindow(win)
-        cv2.setMouseCallback(win, _on_mouse)
+        cv2.waitKey(1)  # let the window realise before wiring the mouse callback
     except cv2.error as e:
-        print(f"FAIL: no display available ({e}). Use tools/probe_gemini.py headless.",
-              file=sys.stderr)
+        print(f"FAIL: cannot open a window ({e}). No display? Use tools/probe_gemini.py "
+              "for a headless read-out (on Wayland try: QT_QPA_PLATFORM=xcb).", file=sys.stderr)
         pipeline.stop()
         return 1
+    # Mouse-hover read-out is a nice-to-have; some GUI backends (Qt on Wayland)
+    # reject setMouseCallback with a NULL handler. Don't let that kill the viewer.
+    hover = True
+    try:
+        cv2.setMouseCallback(win, _on_mouse)
+    except cv2.error:
+        hover = False
+        print("(mouse hover read-out unavailable on this GUI backend — continuing without it)")
 
     span = max(args.far - args.near, 1.0)
     scale = None
@@ -127,15 +135,14 @@ def main(argv=None):
             valid = mm[mm > 0]
             cx, cy = w // 2, h // 2
             cv2.drawMarker(bgr, (cx, cy), (255, 255, 255), cv2.MARKER_CROSS, 16, 1)
-            mxv = max(0, min(_cursor[0], w - 1))
-            myv = max(0, min(_cursor[1], h - 1))
-            cur_mm = float(mm[myv, mxv])
-            cv2.circle(bgr, (mxv, myv), 4, (255, 255, 255), 1)
-
-            lines = [
-                f"{w}x{h}  {fmt}  scale={scale:.3f}  fps={fps:4.1f}",
-                f"centre: {mm[cy, cx]:6.0f} mm     cursor: {cur_mm:6.0f} mm",
-            ]
+            lines = [f"{w}x{h}  {fmt}  scale={scale:.3f}  fps={fps:4.1f}"]
+            if hover:
+                mxv = max(0, min(_cursor[0], w - 1))
+                myv = max(0, min(_cursor[1], h - 1))
+                cv2.circle(bgr, (mxv, myv), 4, (255, 255, 255), 1)
+                lines.append(f"centre: {mm[cy, cx]:6.0f} mm     cursor: {mm[myv, mxv]:6.0f} mm")
+            else:
+                lines.append(f"centre: {mm[cy, cx]:6.0f} mm")
             if valid.size:
                 lines.append(f"valid {100 * valid.size / mm.size:3.0f}%   "
                              f"min {valid.min():.0f}  med {np.median(valid):.0f}  max {valid.max():.0f} mm")
