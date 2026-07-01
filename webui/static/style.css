@@ -1,0 +1,491 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #1a1a1a;
+  --surface: #242424;
+  --border: #333;
+  --text: #e0e0e0;
+  --muted: #888;
+  --accent: #4a90d9;
+  --danger: #d94a4a;
+  --success: #4ad97a;
+  --sidebar-w: 220px;
+  --props-w: 240px;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  height: 100vh;
+}
+
+/* ── Sidebar ─────────────────────────────────────── */
+#sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+#sidebar h2 {
+  padding: 14px 16px 10px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+/* ── Source section ──────────────────────────────── */
+#source-section {
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+#source-section h2 {
+  border-bottom: none;
+  padding-bottom: 8px;
+}
+
+.source-radios {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 16px 10px;
+}
+
+.radio-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.radio-label input[type="radio"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+#video-file-row {
+  padding: 0 12px 10px;
+}
+
+#video-file-select {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+#video-file-select:focus { outline: none; border-color: var(--accent); }
+
+/* ── Tile list ───────────────────────────────────── */
+#tile-list {
+  list-style: none;
+  flex: 1;
+  overflow-y: auto;
+}
+
+#tile-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+  transition: background .1s;
+}
+
+#tile-list li:hover { background: rgba(255,255,255,.04); }
+#tile-list li.selected { background: rgba(74,144,217,.15); }
+#tile-list li.disabled { opacity: .45; }
+#tile-list li.triggered { background: rgba(255,255,255,.18); }
+
+.tile-swatch {
+  width: 14px; height: 14px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.tile-label {
+  flex: 1;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile-note {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.tile-toggle {
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--muted);
+}
+
+.tile-toggle.on  { color: var(--success); }
+.tile-toggle.off { color: var(--danger); }
+
+.tile-delete {
+  background: none;
+  border: none;
+  color: var(--danger);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  opacity: .6;
+}
+.tile-delete:hover { opacity: 1; }
+
+/* ── Center canvas panel ─────────────────────────── */
+#canvas-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  overflow: hidden;
+  padding: 12px;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Flexible area that fills all remaining vertical space.
+   #feed-container is sized (and rotated) in JS via layoutFeed(). */
+#feed-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;   /* positioning context for the resize grips */
+}
+
+#feed-container {
+  position: relative;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  transform-origin: center center;
+  transition: transform .15s ease;
+  /* width / height set dynamically by layoutFeed() */
+}
+
+#feed {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: fill;
+}
+
+#overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  pointer-events: none;
+}
+
+/* Drag-to-resize grips. Right edge = width, bottom edge = height, corner =
+   both. Their left/top are set by layoutFeed(); translate(-50%,-50%) centres
+   each grip on that anchor point so they sit right on the feed's edges. */
+.resize-handle {
+  position: absolute;
+  z-index: 5;
+  opacity: .6;
+  transition: opacity .1s;
+  pointer-events: all;
+  transform: translate(-50%, -50%);
+}
+.resize-handle:hover { opacity: 1; }
+
+.resize-handle.e {
+  width: 12px;
+  height: 48px;
+  cursor: ew-resize;
+}
+.resize-handle.s {
+  width: 48px;
+  height: 12px;
+  cursor: ns-resize;
+}
+.resize-handle.e::before,
+.resize-handle.s::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  background: var(--accent);
+  border-radius: 3px;
+}
+.resize-handle.e::before { width: 4px; height: 38px; }
+.resize-handle.s::before { height: 4px; width: 38px; }
+
+.resize-handle.se {
+  width: 20px;
+  height: 20px;
+  cursor: nwse-resize;
+  border-right: 3px solid var(--accent);
+  border-bottom: 3px solid var(--accent);
+  border-bottom-right-radius: 5px;
+  opacity: .75;
+}
+.resize-handle.se::before {
+  content: "";
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 9px;
+  height: 9px;
+  border-right: 2px solid var(--accent);
+  border-bottom: 2px solid var(--accent);
+}
+
+#overlay.interactive { pointer-events: all; }
+
+/* SVG tile polygons */
+.tile-poly {
+  fill-opacity: .15;
+  stroke-width: 2;
+  cursor: pointer;
+  pointer-events: all;
+  transition: fill-opacity .1s;
+}
+.tile-poly:hover { fill-opacity: .25; }
+.tile-poly.selected { stroke-width: 2.5; }
+.tile-poly.triggered { fill-opacity: .65; }
+
+.tile-text {
+  fill: #fff;
+  font-size: 13px;
+  font-family: system-ui, sans-serif;
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+/* Vertex drag handles */
+.vertex-handle {
+  fill: #fff;
+  stroke: #333;
+  stroke-width: 1.5;
+  cursor: grab;
+  pointer-events: all;
+}
+.vertex-handle:active { cursor: grabbing; }
+
+/* Draw-mode vertex dots — click one to close the polygon.
+   Base radius is set as an SVG attribute in JS; hover uses px units
+   (a unitless CSS `r` is invalid and gets ignored). */
+.draw-vertex {
+  fill: #fff;
+  stroke: #f5a623;
+  stroke-width: 2;
+  cursor: pointer;
+  pointer-events: all;
+  transition: r .1s, fill .1s, stroke .1s;
+}
+.draw-vertex:hover { fill: #f5a623; r: 10px; }
+.draw-vertex.first { stroke: var(--success); stroke-width: 2.5; }
+.draw-vertex.first.closable { fill: var(--success); }
+.draw-vertex.first:hover { fill: var(--success); r: 11px; }
+
+/* Suggestion overlays */
+.suggestion-poly {
+  fill: rgba(255, 220, 0, .12);
+  stroke: #ffdc00;
+  stroke-width: 1.5;
+  stroke-dasharray: 8 4;
+  cursor: pointer;
+  pointer-events: all;
+}
+.suggestion-poly:hover { fill: rgba(255, 220, 0, .25); }
+
+/* ── Toolbar ─────────────────────────────────────── */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.mode-badge {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.mode-badge.LIVE   { border-color: var(--success); color: var(--success); }
+.mode-badge.FREEZE { border-color: var(--accent);  color: var(--accent);  }
+.mode-badge.DRAW   { border-color: #f5a623;         color: #f5a623;        }
+.mode-badge.SELECT { border-color: var(--accent);  color: var(--accent);  }
+
+.spacer { flex: 1; }
+
+#status-msg {
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 120px;
+  text-align: right;
+}
+#status-msg.ok  { color: var(--success); }
+#status-msg.err { color: var(--danger);  }
+
+/* ── Video controls bar ──────────────────────────── */
+#video-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 0;
+  flex-wrap: nowrap;
+}
+
+.play-btn {
+  min-width: 80px;
+  font-size: 13px;
+}
+
+.time-stamp {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+}
+
+#timeline {
+  flex: 1;
+  height: 4px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  /* Custom track */
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+
+#timeline::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
+
+#timeline::-moz-range-thumb {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
+
+.speed-select {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 4px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.speed-select:focus { outline: none; border-color: var(--accent); }
+
+/* ── Props panel ─────────────────────────────────── */
+#props-panel {
+  width: var(--props-w);
+  min-width: var(--props-w);
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+#props-panel h2 {
+  padding: 14px 16px 10px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.props-actions {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+#props-form {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.prop-row { display: flex; flex-direction: column; gap: 4px; }
+.prop-row label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.prop-row input,
+.prop-row select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 5px 8px; font-size: 13px; width: 100%; }
+.prop-row input[type="color"] { height: 32px; padding: 2px 4px; cursor: pointer; }
+.prop-row input:focus,
+.prop-row select:focus { outline: none; border-color: var(--accent); }
+
+.hint { color: var(--muted); font-size: 13px; line-height: 1.5; }
+
+/* ── Buttons ─────────────────────────────────────── */
+button {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: background .1s, border-color .1s;
+  white-space: nowrap;
+}
+button:hover { background: rgba(255,255,255,.07); border-color: #555; }
+button:active { background: rgba(255,255,255,.12); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover { background: #5ba3e8; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }

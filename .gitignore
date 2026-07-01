@@ -36,6 +36,9 @@ htmlcov/
 config.json
 src/config.json
 
+# WebUI tile config — generated at runtime, not committed
+config/tiles.json
+
 # Generated ArUco markers (run tools/generate_aruco.py)
 markers/
 

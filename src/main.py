@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 
 import cv2
@@ -17,6 +18,10 @@ from detection import (above_floor_mask, build_keyboard, detect_hits_labeled,
                        suppress_white_under_black, validate_config)
 
 log = logging.getLogger("floor_piano")
+
+# Path to the WebUI tile config — watched for hot-reload without restart.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TILES_PATH = os.path.join(_SCRIPT_DIR, "..", "config", "tiles.json")
 
 
 class ConfigError(RuntimeError):
@@ -74,6 +79,11 @@ class FloorPiano:
             self.audio = PianoAudio(keys=self.key_names)
         self._running = False
 
+        # WebUI tile config — populated by the watcher thread, used read-only in process_frame.
+        self._tiles = []
+        self._tiles_lock = threading.Lock()
+        self._tiles_mtime = 0.0
+
     def warp(self, depth_array):
         # INTER_NEAREST: never blend in the 0 ("no reading") holes, which would
         # create artificially-close edge pixels and false triggers.
@@ -124,6 +134,8 @@ class FloorPiano:
 
         self.camera.start()
         self._running = True
+        watcher = threading.Thread(target=self._watch_tiles, daemon=True, name="tiles-watcher")
+        watcher.start()
         last_fps_log = 0.0
         corners_checked = False
         try:
@@ -175,6 +187,27 @@ class FloorPiano:
                 cv2.rectangle(vis, (k.x0, k.y0), (k.x1, k.y1), color, -1)
                 cv2.rectangle(vis, (k.x0, k.y0), (k.x1, k.y1), (200, 200, 200), 1)
         cv2.imshow("Floor Piano - 3D View", vis)
+
+    def _watch_tiles(self):
+        """Poll config/tiles.json every 1 s and hot-reload on mtime change."""
+        while self._running:
+            try:
+                stat = os.stat(TILES_PATH)
+                if stat.st_mtime != self._tiles_mtime:
+                    with open(TILES_PATH) as f:
+                        doc = json.load(f)
+                    tiles = [t for t in doc.get("tiles", []) if t.get("enabled", True)]
+                    with self._tiles_lock:
+                        self._tiles = tiles
+                        self._tiles_mtime = stat.st_mtime
+                    log.info("Tiles hot-reloaded: %d tile(s)", len(tiles))
+            except FileNotFoundError:
+                pass
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                log.warning("tiles.json parse error, keeping previous tiles: %s", e)
+            except Exception as e:
+                log.warning("Tile watcher error: %s", e)
+            time.sleep(1.0)
 
     def shutdown(self):
         log.info("Shutting down...")
