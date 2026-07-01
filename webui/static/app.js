@@ -745,10 +745,10 @@ function onCornerMouseDown(e, idx) {
 }
 
 function onPolyClick(e, tileId) {
-  if (state.mode === "LIVE" || state.mode === "DRAW") return;
+  if (state.mode === "DRAW") return;
   const tile = state.tiles.find(t => t.id === tileId);
-  if (tile) playNote(tile.note);
-  if (state.mode === "CORNERS") return;  // a stray click shouldn't leave corner mode
+  if (tile) playNote(tile.note);              // painted keys act as buttons in any mode
+  if (state.mode === "LIVE" || state.mode === "CORNERS") return;  // just play, don't edit
   selectTile(tileId);
 }
 
