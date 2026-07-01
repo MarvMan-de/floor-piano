@@ -47,7 +47,7 @@ You can verify almost everything except the camera itself, in this order:
 
 1. **Logic (numpy only):**
    ```bash
-   pip install -r requirements-dev.txt && pytest
+   pip install -r requirements.txt && pytest
    ```
    Detection (blob assignment, debounce, press-height band), geometry, keyboard
    layout, mat auto-calibration, the full FloorPiano pipeline with injected

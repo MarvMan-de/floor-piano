@@ -1,11 +1,26 @@
-opencv-contrib-python>=4.7   # MUST be the "contrib" build — we use cv2.aruco.
-                             # NOT opencv-python and NOT apt python3-opencv (no aruco).
-                             # conda users: the conda-forge package "py-opencv" also works.
-                             # Verify: python3 -c "import cv2; print(cv2.__version__, hasattr(cv2,'aruco'))"  -> must be True
-pygame
-numpy
+# Floor Piano — all Python dependencies in ONE file.
+#     pip install -r requirements.txt
+# (Everything below installs on Linux x86_64 + Raspberry Pi arm64, Python 3.8–3.13.)
 
-# NOTE: pyorbbecsdk is intentionally NOT listed here.
-# It has no arm64 PyPI wheel, so including it would make `pip install -r
-# requirements.txt` fail and skip the packages above. Install it separately by
-# building the OrbbecSDK Python bindings from source (+ udev rules). See docs/SETUP.md.
+# --- Core: detection + audio ---
+opencv-contrib-python>=4.7   # MUST be the "contrib" build (we use cv2.aruco), NOT
+                             # plain opencv-python / apt python3-opencv.
+                             # Verify: python3 -c "import cv2; print(hasattr(cv2,'aruco'))" -> True
+numpy
+pygame
+
+# --- Orbbec depth camera (Gemini 335 etc.) ---
+# Imports as 'pyorbbecsdk'. Prebuilt wheels now exist for Linux x86_64 + arm64 and
+# Win/macOS, so it installs normally (the old "no arm64 wheel" caveat is gone).
+# NOTE: it pulls in opencv-python as a dependency; if cv2.aruco ever goes missing,
+# reinstall opencv-contrib-python last.
+pyorbbecsdk2>=2.0
+
+# --- Web UI (FastAPI, reachable over the Pi hotspot) ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+aiofiles>=23.0.0
+python-multipart>=0.0.9
+
+# --- Dev / tests ---
+pytest

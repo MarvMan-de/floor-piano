@@ -1,4 +1,0 @@
-# Development / test dependencies (not needed to run the piano).
-# Install with:  pip install -r requirements-dev.txt
--r requirements.txt
-pytest

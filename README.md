@@ -63,7 +63,7 @@ The trigger logic lives in `src/detection.py` and is hardware-free, so it can be
 tested without a camera:
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 pytest
 ```
 
