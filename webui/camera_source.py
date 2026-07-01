@@ -10,14 +10,22 @@ import numpy as np
 
 
 def _letterbox(img: np.ndarray, tw: int, th: int) -> np.ndarray:
-    """Fit img into a tw x th frame keeping aspect ratio (black bars, no distortion)."""
+    """Fit img into a tw x th frame keeping aspect ratio (black bars, no distortion).
+
+    Works for both BGR (HxWx3) and single-channel depth (HxW). Depth is resized
+    with nearest-neighbour so distances / 'no reading' holes are never blended.
+    Colour and its aligned depth get the SAME scale + offset, so they stay
+    pixel-registered after letterboxing.
+    """
     h, w = img.shape[:2]
     if w == tw and h == th:
         return img
     scale = min(tw / w, th / h)
     nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
-    resized = cv2.resize(img, (nw, nh))
-    canvas = np.zeros((th, tw, 3), dtype=img.dtype)
+    interp = cv2.INTER_NEAREST if img.ndim == 2 else cv2.INTER_LINEAR
+    resized = cv2.resize(img, (nw, nh), interpolation=interp)
+    shape = (th, tw) if img.ndim == 2 else (th, tw, img.shape[2])
+    canvas = np.zeros(shape, dtype=img.dtype)
     x0, y0 = (tw - nw) // 2, (th - nh) // 2
     canvas[y0:y0 + nh, x0:x0 + nw] = resized
     return canvas
@@ -73,6 +81,11 @@ class MediaSource:
         # resized to (width, height). Colour — not depth — so the printed piano
         # keys are visible for drawing tiles.
         self._ob: Any = None
+        # D2C alignment: when detect_enabled, also grab depth aligned to colour
+        # and letterbox it identically, so depth[y,x] matches the colour tiles.
+        self._align: Any = None
+        self._depth: Optional[np.ndarray] = None   # latest aligned depth (uint16 mm, WxH)
+        self.detect_enabled: bool = False
 
         # Frame dimensions
         self.width = width
@@ -131,6 +144,8 @@ class MediaSource:
             except Exception:
                 pass
             self._ob = None
+        self._align = None
+        self._depth = None
 
     def read_frame(self) -> Optional[np.ndarray]:
         """Return a copy of the latest BGR frame, or None if not yet available."""
@@ -187,9 +202,11 @@ class MediaSource:
         return cv2.VideoCapture(path)
 
     def _open_orbbec(self):
-        """Start a pyorbbecsdk COLOUR pipeline (Gemini RGB), or None if unavailable."""
+        """Start a pyorbbecsdk COLOUR (+DEPTH, D2C-aligned) pipeline, or None."""
+        self._align = None
         try:
-            from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat
+            from pyorbbecsdk import (Pipeline, Config, OBSensorType, OBFormat,
+                                     AlignFilter, OBStreamType)
         except Exception as e:
             print(f"[camera_source] pyorbbecsdk not available ({e}) — no Orbbec camera")
             return None
@@ -207,15 +224,30 @@ class MediaSource:
                     pass
             prof = prof or plist.get_default_video_stream_profile()
             cfg.enable_stream(prof)
+            # Depth too — best effort; the colour path still works if it fails.
+            try:
+                dlist = pipe.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+                dprof = None
+                try:
+                    dprof = dlist.get_video_stream_profile(0, 0, OBFormat.Y16, 0)
+                except Exception:
+                    pass
+                dprof = dprof or dlist.get_default_video_stream_profile()
+                cfg.enable_stream(dprof)
+                self._align = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+            except Exception as e:
+                print(f"[camera_source] depth stream unavailable ({e}) — colour only")
             pipe.start(cfg)
-            print("[camera_source] Orbbec colour stream started (Gemini RGB)")
+            print("[camera_source] Orbbec started (Gemini RGB%s)"
+                  % (" + aligned depth" if self._align else ""))
             return pipe
         except Exception as e:
-            print(f"[camera_source] Orbbec colour start failed ({e})")
+            print(f"[camera_source] Orbbec start failed ({e})")
             return None
 
     def _read_orbbec(self) -> None:
-        """Grab one Gemini colour frame, decode + resize, store as current BGR frame."""
+        """Grab one Gemini frame; store colour (letterboxed) and, when detection
+        is on, the D2C-aligned depth letterboxed the same way."""
         if self._ob is None:
             time.sleep(0.05)
             return
@@ -225,6 +257,17 @@ class MediaSource:
             frames = None
         if frames is None:
             return
+
+        # Only pay for D2C alignment while a play/test mode needs depth.
+        if self.detect_enabled and self._align is not None:
+            try:
+                aligned = self._align.process(frames)
+            except Exception:
+                aligned = None
+            if aligned is not None:
+                self._store_depth(aligned.get_depth_frame())
+                frames = aligned  # colour comes from the aligned set too
+
         color = frames.get_color_frame()
         if color is None:
             return
@@ -235,6 +278,27 @@ class MediaSource:
         # aspect-preserving scale + letterbox, so proportions stay true and the
         # SVG overlay / tiles.json stay in one coordinate system.
         self._store_frame(_letterbox(bgr, self.width, self.height))
+
+    def _store_depth(self, depth_frame) -> None:
+        """Letterbox the aligned depth into (width,height) mm and store it."""
+        if depth_frame is None:
+            return
+        w, h = depth_frame.get_width(), depth_frame.get_height()
+        raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
+        if raw.size != w * h:
+            return
+        depth = _letterbox(raw.reshape(h, w), self.width, self.height)
+        with self._lock:
+            self._depth = depth
+
+    def read_depth_aligned(self) -> Optional[np.ndarray]:
+        """Latest D2C-aligned, letterboxed depth (uint16 mm) — same space as tiles."""
+        with self._lock:
+            return None if self._depth is None else self._depth.copy()
+
+    def set_detect(self, enabled: bool) -> None:
+        """Toggle depth alignment/capture (only paid for in play/test mode)."""
+        self.detect_enabled = bool(enabled)
 
     def _apply_pending_source(self) -> bool:
         """Consume _pending_source if set. Returns True if a swap occurred."""
@@ -307,7 +371,9 @@ class MediaSource:
             self._frame = frame
         cb = self.on_frame_cb
         source = self._source_type
-        if cb is not None and source == "video":
+        # Fire per-frame detection for video (brightness) and orbbec (depth). The
+        # orbbec callback reads the aligned depth via read_depth_aligned().
+        if cb is not None and source in ("video", "orbbec"):
             try:
                 cb(frame)
             except Exception:

@@ -63,6 +63,10 @@ const state = {
   _triggerInterval: null,
   // Scrubber being dragged (suppress status updates)
   _scrubbing: false,
+
+  // Play/test mode: server does depth finger-detection, browser plays the notes
+  playMode: false,
+  _playInterval: null,
 };
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
@@ -92,6 +96,8 @@ const btnRotate     = document.getElementById("btn-rotate");
 const btnAddDraw    = document.getElementById("btn-add-draw");
 const btnAutodetect = document.getElementById("btn-autodetect");
 const btnPlaceCorners = document.getElementById("btn-place-corners");
+const btnPlay        = document.getElementById("btn-play");
+const btnCaptureSurface = document.getElementById("btn-capture-surface");
 const suggActions   = document.getElementById("suggestion-actions");
 const btnAcceptAll  = document.getElementById("btn-accept-all");
 const btnRejectAll  = document.getElementById("btn-reject-all");
@@ -361,6 +367,8 @@ async function pollTriggers() {
     const data = await res.json();
     for (const ev of data.triggers || []) {
       flashTile(ev.tile_id);
+      const tile = state.tiles.find(t => t.id === ev.tile_id);
+      if (tile) playNote(tile.note);   // browser plays the pressed note
     }
   } catch (_) {}
 }
@@ -377,6 +385,48 @@ function flashTile(tileId) {
   if (li) {
     li.classList.add("triggered");
     setTimeout(() => li.classList.remove("triggered"), 200);
+  }
+}
+
+// ── Play / test mode (server does depth finger-detection, browser plays) ────
+async function captureSurface() {
+  setStatus("Erfasse Oberfläche… (Finger weg vom Bild!)");
+  try {
+    const res = await fetch("/api/capture_surface", { method: "POST" });
+    if (!res.ok) throw new Error((await res.json()).detail || "capture failed");
+    const data = await res.json();
+    setStatus(`Oberfläche erfasst (${Math.round((data.valid_frac || 0) * 100)}% gültig) `
+              + "— jetzt Tasten drücken", "ok");
+  } catch (err) {
+    setStatus("Oberfläche erfassen fehlgeschlagen: " + err.message, "err");
+  }
+}
+
+async function togglePlayMode() {
+  const on = !state.playMode;
+  try {
+    const res = await fetch("/api/play", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: on }),
+    });
+    const data = await res.json().catch(() => ({}));
+    state.playMode = on;
+    if (btnPlay) btnPlay.textContent = on ? "⏹ Stop" : "▶ Play";
+    clearInterval(state._playInterval);
+    state._playInterval = null;
+    if (on) {
+      setMode("LIVE");   // live feed with the tiles overlaid; presses flash + sound
+      state._playInterval = setInterval(pollTriggers, 120);
+      setStatus(data.surface_ready
+        ? "Play: drücke die Tasten im Bild"
+        : "Play aktiv — bitte zuerst 'Oberfläche erfassen'",
+        data.surface_ready ? "" : "err");
+    } else {
+      setStatus("Play beendet");
+      setTimeout(() => setStatus(""), 1500);
+    }
+  } catch (err) {
+    setStatus("Play-Umschalten fehlgeschlagen: " + err.message, "err");
   }
 }
 
@@ -1109,6 +1159,8 @@ function bindEvents() {
     h.addEventListener("dblclick", resetFeedSize);
   });
   if (btnPlaceCorners) btnPlaceCorners.addEventListener("click", enterCornersMode);
+  if (btnPlay) btnPlay.addEventListener("click", togglePlayMode);
+  if (btnCaptureSurface) btnCaptureSurface.addEventListener("click", captureSurface);
   btnAutodetect.addEventListener("click", runAutoCorners);
   btnAcceptAll.addEventListener("click", acceptAllSuggestions);
   btnRejectAll.addEventListener("click", clearSuggestions);

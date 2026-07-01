@@ -22,6 +22,8 @@ from fastapi.staticfiles import StaticFiles
 
 from webui.autodetect import detect_corners, detect_tiles, tiles_from_corners
 from webui.camera_source import MediaSource
+from webui.depth_detect import (DepthHitTracker, build_tile_label_map,
+                               detect_tile_hits_depth)
 from webui.tile_store import default_tiles_doc, load_tiles, save_tiles, validate_tiles_doc
 from webui.video_detect import detect_tile_hits
 
@@ -77,6 +79,22 @@ _trigger_q: queue.Queue = queue.Queue(maxsize=500)
 # Optional audio player for video mode (requires pygame + sound samples)
 _audio: Any = None
 
+# Play/test mode: depth-based finger-press detection against a captured surface.
+_play_mode: bool = False
+_surface_mm: Optional[np.ndarray] = None   # per-pixel reference depth of the empty surface
+_label_map: Optional[np.ndarray] = None    # tile polygons painted into a label map
+_label_ids: list = []                      # tile ids indexed by _label_map values
+_depth_tracker: Optional[DepthHitTracker] = None   # edge-trigger + release debounce
+
+
+def _rebuild_label_map() -> None:
+    """(Re)build the tile label map from the current config (call on tile changes)."""
+    global _label_map, _label_ids
+    tiles = _tile_cache.get("tiles", [])
+    w = int(_tile_cache.get("frame_width", 640))
+    h = int(_tile_cache.get("frame_height", 480))
+    _label_map, _label_ids = build_tile_label_map(tiles, w, h)
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -128,25 +146,36 @@ def _try_init_audio() -> Any:
 
 
 def _make_detection_cb():
-    """Return a frame callback that detects tile hits and feeds the trigger queue."""
+    """Per-frame detection → trigger queue (browser plays the note on poll).
+
+    Only runs in play mode. Orbbec: depth background-subtraction against the
+    captured surface (finger closer than surface). Video: brightness fallback.
+    A DepthHitTracker edge-triggers so a held press fires its note only once.
+    """
     def cb(frame: np.ndarray) -> None:
+        if not _play_mode or _depth_tracker is None:
+            return
         tiles = _tile_cache.get("tiles", [])
         if not tiles:
             return
-        triggered_ids = detect_tile_hits(frame, tiles)
+        src = _media._source_type if _media else None
+        if src == "orbbec":
+            if _surface_mm is None or _label_map is None:
+                return
+            depth = _media.read_depth_aligned()
+            if depth is None or depth.shape != _surface_mm.shape:
+                return
+            hits = detect_tile_hits_depth(depth, _surface_mm, _label_map, _label_ids)
+        elif src == "video":
+            hits = set(detect_tile_hits(frame, tiles))
+        else:
+            return
+        fired = _depth_tracker.update(hits)   # rising edges only
         now = time.time()
-        for tid in triggered_ids:
+        for tid in fired:
             try:
                 _trigger_q.put_nowait({"tile_id": tid, "t": now})
             except queue.Full:
-                pass
-        # Drive audio if available
-        if _audio is not None and triggered_ids:
-            note_map = {t["id"]: t["note"] for t in tiles}
-            active = {note_map[tid] for tid in triggered_ids if tid in note_map}
-            try:
-                _audio.update(active)
-            except Exception:
                 pass
     return cb
 
@@ -179,10 +208,56 @@ async def post_config(request: Request) -> JSONResponse:
         raise HTTPException(status_code=422, detail=str(exc))
     save_tiles(body)
     _tile_cache = body
+    _rebuild_label_map()  # tiles changed -> refresh the depth-detection label map
     # Refresh audio note list when config changes
     global _audio
     _audio = _try_init_audio()
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Play / test mode: depth-based finger-press detection
+# ---------------------------------------------------------------------------
+
+@app.post("/api/play")
+async def set_play(request: Request) -> JSONResponse:
+    """Enter/leave play mode. {"enabled": true|false}. Enabling turns on depth
+    alignment, rebuilds the tile label map and resets the hit tracker."""
+    global _play_mode, _depth_tracker
+    body = await request.json()
+    enabled = bool(body.get("enabled", True))
+    _play_mode = enabled
+    if _media is not None:
+        _media.set_detect(enabled)
+    _depth_tracker = DepthHitTracker(release_frames=3) if enabled else None
+    _rebuild_label_map()
+    return JSONResponse({"ok": True, "play": _play_mode,
+                         "surface_ready": _surface_mm is not None})
+
+
+@app.post("/api/capture_surface")
+async def capture_surface() -> JSONResponse:
+    """Capture the empty surface as the per-pixel depth reference (no fingers!).
+
+    Medians a few aligned-depth frames for noise. Requires the depth camera.
+    """
+    global _surface_mm
+    if _media is None:
+        raise HTTPException(status_code=503, detail="Media source not ready")
+    _media.set_detect(True)  # ensure aligned depth is flowing
+    loop = asyncio.get_event_loop()
+    grabbed = []
+    for _ in range(12):
+        d = await loop.run_in_executor(None, _media.read_depth_aligned)
+        if d is not None:
+            grabbed.append(d)
+        await asyncio.sleep(0.05)
+    if not grabbed:
+        raise HTTPException(status_code=503,
+                            detail="No depth frames — is the Orbbec connected and streaming?")
+    _surface_mm = np.median(np.stack(grabbed), axis=0).astype(np.uint16)
+    valid = float((_surface_mm > 0).mean())
+    return JSONResponse({"ok": True, "valid_frac": round(valid, 2)})
 
 
 # ---------------------------------------------------------------------------
