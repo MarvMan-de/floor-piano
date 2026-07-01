@@ -578,6 +578,7 @@ function renderSidebar() {
     li.appendChild(tog);
     li.appendChild(del);
     li.addEventListener("click", () => {
+      playNote(tile.note);
       if (state.mode === "LIVE") return;
       selectTile(tile.id);
     });
@@ -745,6 +746,9 @@ function onCornerMouseDown(e, idx) {
 
 function onPolyClick(e, tileId) {
   if (state.mode === "LIVE" || state.mode === "DRAW") return;
+  const tile = state.tiles.find(t => t.id === tileId);
+  if (tile) playNote(tile.note);
+  if (state.mode === "CORNERS") return;  // a stray click shouldn't leave corner mode
   selectTile(tileId);
 }
 
@@ -1063,6 +1067,22 @@ function esc(str) {
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;");
+}
+
+// Play a note's sample in the browser (test the layout by clicking tiles).
+// Samples are served from /sounds; filename convention: C#4 -> Cs4.wav.
+const _audioCache = {};
+function playNote(note) {
+  if (!note) return;
+  try {
+    let a = _audioCache[note];
+    if (!a) {
+      a = new Audio("/sounds/" + note.replace("#", "s") + ".wav");
+      _audioCache[note] = a;
+    }
+    a.currentTime = 0;
+    a.play().catch(() => {});  // ignore autoplay/decode errors (e.g. missing sample)
+  } catch (_) {}
 }
 
 function updatePropsPolygonField(tile) {

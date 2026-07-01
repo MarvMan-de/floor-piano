@@ -27,11 +27,15 @@ from webui.video_detect import detect_tile_hits
 
 _REPO_ROOT = Path(__file__).parent.parent
 _STATIC_DIR = Path(__file__).parent / "static"
+_SOUNDS_DIR = _REPO_ROOT / "src" / "sounds"
 _DEMO_DIR = _REPO_ROOT / "demo"
 _VIDEO_EXTS = ("*.mp4", "*.avi", "*.mov", "*.mkv")
 
 app = FastAPI(title="Floor Piano WebUI")
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+# Serve the note samples so the UI can play a tile's tone on click (browser-side).
+if _SOUNDS_DIR.is_dir():
+    app.mount("/sounds", StaticFiles(directory=str(_SOUNDS_DIR)), name="sounds")
 
 
 class _NoCacheStatic:
@@ -386,14 +390,21 @@ async def _frame_generator(request: Request):
 # ---------------------------------------------------------------------------
 
 class _DropCancelledError(logging.Filter):
-    """Silence the benign CancelledError traceback uvicorn logs when an active
-    /video_feed stream is aborted on Ctrl-C. The server still shuts down cleanly;
-    this only stops the scary (but harmless) traceback. CancelledError is never a
-    real, user-actionable error here."""
+    """Silence the benign CancelledError traceback that uvicorn/asyncio log when
+    the server is interrupted (Ctrl-C, incl. force-quit double Ctrl-C). The server
+    still shuts down cleanly; this only stops the scary but harmless traceback.
+    Walks the exception __context__/__cause__ chain because on shutdown the raised
+    exception is often a KeyboardInterrupt *caused by* a CancelledError."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         exc = record.exc_info[1] if record.exc_info else None
-        return not isinstance(exc, asyncio.CancelledError)
+        seen = set()
+        while exc is not None and id(exc) not in seen:
+            if isinstance(exc, asyncio.CancelledError):
+                return False
+            seen.add(id(exc))
+            exc = exc.__cause__ or exc.__context__
+        return True
 
 
 if __name__ == "__main__":
@@ -406,7 +417,10 @@ if __name__ == "__main__":
     parser.add_argument("--camera-index", type=int, default=0)
     args = parser.parse_args()
 
-    logging.getLogger("uvicorn.error").addFilter(_DropCancelledError())
+    # Attach to every logger that might emit the shutdown CancelledError.
+    _cancel_filter = _DropCancelledError()
+    for _name in ("uvicorn.error", "uvicorn", "asyncio"):
+        logging.getLogger(_name).addFilter(_cancel_filter)
 
     _tile_cache["camera_index"] = args.camera_index
     uvicorn.run(app, host=args.host, port=args.port)
