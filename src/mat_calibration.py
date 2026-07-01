@@ -240,15 +240,20 @@ def refine_corners(bgr, corners, num_white,
 
 
 def auto_calibrate(bgr, num_white=None,
-                   width=constants.TARGET_WIDTH, height=constants.TARGET_HEIGHT):
+                   width=constants.TARGET_WIDTH, height=constants.TARGET_HEIGHT,
+                   min_area_frac=0.2):
     """Full mat-based calibration of one (foot-free) BGR frame.
 
     Returns (corners, info): corners as a float32 (4,2) array in TL,TR,BR,BL
     canvas order, or (None, info) when no mat-like region is found. info
     carries quality metrics: black-key IoU and the refinement residuals (px).
+
+    ``min_area_frac`` is the smallest fraction of the frame the mat may cover.
+    The default (0.2) suits a mat that fills the view (e.g. the test clips); pass
+    a smaller value when the mat is only a strip of a wider camera view.
     """
     num_white = constants.DEFAULT_NUM_WHITE if num_white is None else num_white
-    quad = find_mat_quad(bgr)
+    quad = find_mat_quad(bgr, min_area_frac)
     if quad is None:
         return None, {"reason": "no mat-sized bright region found"}
     corners = order_long_axis(quad)

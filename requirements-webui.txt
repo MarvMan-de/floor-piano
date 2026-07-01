@@ -1,0 +1,7 @@
+# WebUI dependencies — install alongside requirements.txt
+# pip install -r requirements.txt -r requirements-webui.txt
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+aiofiles>=23.0.0
+python-multipart>=0.0.9
