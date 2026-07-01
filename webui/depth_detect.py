@@ -12,11 +12,13 @@ Pure numpy/cv2 so it is unit-testable with synthetic depth maps.
 import cv2
 import numpy as np
 
-# Millimetre thresholds — fingers are shallow, so keep threshold just above the
-# depth noise floor. Tunable.
-DEFAULT_THRESHOLD_MM = 20      # min height above the surface to count as a press
-DEFAULT_MAX_HEIGHT_MM = 200    # ignore things far above (hand/arm passing over)
-DEFAULT_MIN_PIXELS = 40        # min press pixels inside a tile to fire it
+# Millimetre "contact band" above the captured surface. A press = something right
+# AT the surface (a fingertip, whose top sits ~finger-thickness above it). A hand
+# hovering / passing over is much higher and falls OUTSIDE the band, so it does
+# NOT trigger — this is the fix for "the note plays when my hand just passes over".
+DEFAULT_CONTACT_MIN_MM = 5     # ignore depth noise right at the surface plane
+DEFAULT_CONTACT_MAX_MM = 30    # fingertip touching; above this = hovering -> ignore
+DEFAULT_MIN_PIXELS = 20        # min contact pixels inside a tile to fire it
 
 
 def build_tile_label_map(tiles, width, height):
@@ -41,23 +43,27 @@ def build_tile_label_map(tiles, width, height):
 
 
 def detect_tile_hits_depth(depth_mm, surface_mm, label_map, tile_ids,
-                           threshold_mm=DEFAULT_THRESHOLD_MM,
-                           max_height_mm=DEFAULT_MAX_HEIGHT_MM,
+                           contact_min_mm=DEFAULT_CONTACT_MIN_MM,
+                           contact_max_mm=DEFAULT_CONTACT_MAX_MM,
                            min_pixels=DEFAULT_MIN_PIXELS):
-    """Return the set of tile ids currently pressed.
+    """Return the set of tile ids currently *touched*.
 
-    A pixel is "pressed" when it and the surface both have a valid reading and it
-    sits between ``threshold_mm`` and ``max_height_mm`` in front of the surface.
-    Per tile, more than ``min_pixels`` such pixels = pressed.
+    ``above = surface - depth`` is how far a pixel sits in front of the captured
+    surface. A **touch** is a pixel in the thin contact band
+    ``contact_min_mm <= above <= contact_max_mm`` — i.e. right at the surface (a
+    fingertip). A hovering / passing hand is much further in front (above >
+    contact_max_mm) and is ignored, so it no longer triggers the note. Per tile,
+    more than ``min_pixels`` contact pixels = pressed.
     """
     if surface_mm is None or depth_mm is None:
         return set()
     d = depth_mm.astype(np.int32)
     s = surface_mm.astype(np.int32)
-    press = (d > 0) & (s > 0) & (d < s - threshold_mm) & (d > s - max_height_mm)
-    if not press.any():
+    above = s - d
+    touch = (d > 0) & (s > 0) & (above >= contact_min_mm) & (above <= contact_max_mm)
+    if not touch.any():
         return set()
-    labels = label_map[press]
+    labels = label_map[touch]
     labels = labels[labels >= 0]
     if labels.size == 0:
         return set()

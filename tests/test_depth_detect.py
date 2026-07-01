@@ -1,4 +1,8 @@
-"""Tests for webui/depth_detect.py — synthetic depth maps, no hardware."""
+"""Tests for webui/depth_detect.py — synthetic depth maps, no hardware.
+
+Detection is a thin "contact band" just above the captured surface: a fingertip
+touching fires; a hand hovering/passing well above the surface does NOT.
+"""
 import numpy as np
 
 from webui.depth_detect import (DepthHitTracker, build_tile_label_map,
@@ -19,43 +23,44 @@ def test_label_map_indices():
     assert lm[50, 50] == 0 and lm[50, 150] == 1 and lm[300, 300] == -1
 
 
-def test_press_in_one_tile_fires_only_it():
+def test_touch_fires_only_that_tile():
     lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150),
                                     _tile(2, 200, 50, 300, 150)], W, H)
     surface = np.full((H, W), 1000, np.uint16)
     depth = surface.copy()
-    depth[70:130, 70:130] = 950  # finger 50 mm in front of the surface, inside tile 1
+    depth[70:130, 70:130] = 985  # fingertip 15 mm above the surface (in contact band)
     assert detect_tile_hits_depth(depth, surface, lm, ids) == {1}
 
 
-def test_tilted_surface_background_subtraction():
+def test_hovering_hand_does_not_fire():
+    """The reported bug: a hand passing ~6 cm over the keys must NOT trigger."""
     lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150)], W, H)
-    ramp = np.linspace(800, 1200, W).astype(np.uint16)   # depth varies left->right
+    surface = np.full((H, W), 1000, np.uint16)
+    depth = surface.copy()
+    depth[70:130, 70:130] = 940  # hand 60 mm in front -> above the contact band
+    assert detect_tile_hits_depth(depth, surface, lm, ids) == set()
+
+
+def test_tilted_surface_contact_fires():
+    lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150)], W, H)
+    ramp = np.linspace(800, 1200, W).astype(np.uint16)   # tilted surface
     surface = np.tile(ramp, (H, 1))
     depth = surface.copy()
-    depth[70:130, 70:130] = surface[70:130, 70:130] - 60  # 60 mm above the local surface
+    depth[70:130, 70:130] = surface[70:130, 70:130] - 15  # 15 mm above local surface
     assert detect_tile_hits_depth(depth, surface, lm, ids) == {1}
 
 
-def test_noise_under_threshold_does_not_fire():
+def test_surface_noise_does_not_fire():
     lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150)], W, H)
     surface = np.full((H, W), 1000, np.uint16)
     depth = surface.copy()
-    depth[70:130, 70:130] = 990  # only 10 mm closer, below the 20 mm threshold
-    assert detect_tile_hits_depth(depth, surface, lm, ids, threshold_mm=20) == set()
-
-
-def test_far_above_surface_ignored():
-    lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150)], W, H)
-    surface = np.full((H, W), 1000, np.uint16)
-    depth = surface.copy()
-    depth[70:130, 70:130] = 500  # 500 mm above surface -> arm/hand, beyond max_height
-    assert detect_tile_hits_depth(depth, surface, lm, ids, max_height_mm=200) == set()
+    depth[70:130, 70:130] = 998  # only 2 mm -> below contact_min (noise)
+    assert detect_tile_hits_depth(depth, surface, lm, ids) == set()
 
 
 def test_no_surface_returns_empty():
     lm, ids = build_tile_label_map([_tile(1, 50, 50, 150, 150)], W, H)
-    assert detect_tile_hits_depth(np.full((H, W), 950, np.uint16), None, lm, ids) == set()
+    assert detect_tile_hits_depth(np.full((H, W), 985, np.uint16), None, lm, ids) == set()
 
 
 def test_tracker_edge_trigger_and_release():
