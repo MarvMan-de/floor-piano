@@ -102,6 +102,34 @@ def test_calibrated_artifacts_never_fire():
     assert fired == set()
 
 
+def test_oblique_surface_press_still_fires():
+    """Camera at an angle: a touching finger occludes surface farther along the
+    ray, so it reads far 'higher' than its thickness (here 55mm). The slope-
+    adaptive band ceiling must still accept it."""
+    ramp = np.tile(np.linspace(800, 2400, W).astype(np.uint16), (H, 1))  # steep tilt
+    det = _detector([_tile(1, 300, 100, 400, 300)], ramp)
+    press = _press(ramp, 320, 150, 380, 250, mm=55)   # would miss a fixed 35mm cap
+    det.update(ramp)
+    fired = set()
+    for _ in range(5):
+        fired |= det.update(press)
+    assert fired == {1}
+
+
+def test_noisy_zone_flicker_does_not_fire_after_calibration():
+    """Noisy pixels get stricter per-pixel thresholds instead of firing (and the
+    zone is NOT blanket-masked)."""
+    surface = _flat()
+    det = _detector([_tile(1, 50, 50, 150, 150)], surface)
+    hi, lo = surface.copy(), _press(surface, 60, 60, 140, 140, mm=24)
+    hi[60:140, 60:140] = 1012                            # flicker 1012 <-> 976
+    det.calibrate_artifacts([hi, lo, hi, lo, hi, lo])   # std ~18mm in the region
+    fired = set()
+    for i in range(16):                                  # keep flickering ±12mm
+        fired |= det.update(hi if i % 2 else lo)
+    assert fired == set()
+
+
 def test_whole_frame_shift_rejected_as_blob():
     """A global shift (camera nudge) moves everything into the band at once —
     one huge blob, not a finger -> rejected instead of firing every tile."""

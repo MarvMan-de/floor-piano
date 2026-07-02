@@ -4,18 +4,25 @@ A press is detected against a captured per-pixel reference of the EMPTY surface
 (background subtraction — works on a tilted surface, no warp needed, because the
 depth is D2C-aligned into the same 640x480 space as the colour tiles).
 
-Three defences make it stable on real, noisy depth (the "random keys keep
-firing" bug came from static artifacts + no motion requirement):
+The camera is never perpendicular to the surface and the depth is noisy, so the
+detector is built from ADAPTIVE per-pixel maps derived at capture time, plus
+temporal gates:
 
-1. **Artifact mask** — right after capturing the surface, pixels that already
-   sit in the contact band with the scene still empty are systematic artifacts
-   (edges, occlusion, glossy reflections). They are masked out permanently
-   (until the next capture), so the same few tiles can no longer fire forever.
-2. **Motion gate** — a pixel may only press if its depth changed recently.
-   A completely static scene therefore can NEVER trigger anything.
-3. **Confirm + re-arm** — a tile fires only after being detected on several
-   consecutive frames, and after release it needs quiet frames before it may
-   fire again. Flicker can't machine-gun notes.
+* **Slope-adaptive band** — under an oblique view, a finger touching the surface
+  occludes surface that is much farther along the ray, so its apparent height
+  can far exceed the finger's thickness. The band's upper edge grows with the
+  local surface slope (``max_map``), so tilted regions still detect touches.
+* **Noise-adaptive floor** — instead of masking every noisy pixel (which made
+  half the frame dead), each pixel's band floor and motion threshold scale with
+  its measured noise (``min_map`` / ``motion_map``): noisy zones get stricter,
+  clean zones stay sensitive.
+* **Artifact mask** — only truly broken pixels (no surface reading, validity
+  flicker, extreme noise, or persistently in-band while empty) are masked.
+* **Motion gate** — a pixel may only press if its depth changed recently; a
+  static scene can never trigger anything.
+* **Band stability + confirm + re-arm** — a pixel must stay in-band for
+  consecutive frames, a tile fires only after consecutive detections, and after
+  release it needs quiet frames before it may fire again.
 
 Pure numpy/cv2 and fully unit-testable with synthetic depth maps.
 """
@@ -23,16 +30,21 @@ import cv2
 import numpy as np
 
 # --- contact band (mm above the captured surface) ---------------------------
-DEFAULT_CONTACT_MIN_MM = 8     # below: depth noise at the surface plane
-DEFAULT_CONTACT_MAX_MM = 35    # above: hovering hand/arm -> ignore
+DEFAULT_CONTACT_MIN_MM = 10    # base band floor (raised locally by noise)
+DEFAULT_CONTACT_MAX_MM = 35    # base band ceiling (raised locally by slope)
+SLOPE_GAIN_PX = 12             # ~finger width in px: ceiling += slope * this
+MAX_BAND_CEIL_MM = 150         # never accept more than this above the surface
+NOISE_FLOOR_GAIN = 3.0         # band floor = max(base, gain*noise + 5)
+NOISE_FLOOR_CAP_MM = 30        # band floor never exceeds this (else zone ~dead)
+NOISE_BROKEN_MM = 30           # std above this = hopeless pixel -> artifact
 
 # --- motion gate -------------------------------------------------------------
-DEFAULT_MOTION_MM = 10         # per-pixel depth change that counts as movement
+DEFAULT_MOTION_MM = 10         # base per-pixel change that counts as movement
 DEFAULT_MOTION_HOLD = 10       # frames a moved pixel stays "active" (~0.5s)
 DEFAULT_BAND_STABLE = 2        # frames a pixel must STAY in-band (kills flicker)
 
 # --- blob shape --------------------------------------------------------------
-DEFAULT_MIN_BLOB_PX = 25       # smaller = speckle noise
+DEFAULT_MIN_BLOB_PX = 20       # smaller = speckle noise
 DEFAULT_MAX_BLOB_FRAC = 0.10   # a finger can't cover >10% of the frame
 
 # --- temporal per-tile logic --------------------------------------------------
@@ -65,10 +77,10 @@ def build_tile_label_map(tiles, width, height):
 class PressDetector:
     """Stateful press detector: feed it aligned depth frames, get fired tiles.
 
-    Create it from the captured surface, feed extra empty frames to
-    ``calibrate_artifacts``, assign tiles with ``set_tiles``, then call
-    ``update(depth)`` once per frame — it returns the tile ids that were newly
-    pressed this frame (edge-triggered; play exactly these notes).
+    Create it from the captured surface, feed the empty capture frames to
+    ``calibrate_artifacts`` (builds the noise/slope maps), assign tiles with
+    ``set_tiles``, then call ``update(depth)`` once per frame — it returns the
+    tile ids newly pressed this frame (edge-triggered; play exactly these).
     """
 
     def __init__(self, surface_mm,
@@ -94,38 +106,71 @@ class PressDetector:
         self.release_frames = max(1, int(release_frames))
         self.rearm_frames = max(0, int(rearm_frames))
 
-        # Pixels we must never trust: no surface reading, or in-band while empty.
         self.artifact = self.surface <= 0
-
+        self.noise = None            # per-pixel std of the empty scene (mm)
+        self._build_maps()
         self.label_map = None
         self.tile_ids = []
         self._reset_runtime()
 
-    # -- setup ---------------------------------------------------------------
+    # -- adaptive maps ---------------------------------------------------------
 
-    def calibrate_artifacts(self, empty_frames, noise_mm=8):
-        """Mark untrustworthy pixels from frames of the EMPTY scene.
+    def _build_maps(self):
+        """Derive per-pixel band and motion thresholds from surface + noise.
 
-        Two kinds of artifact, both of which caused ghost notes on real
-        hardware (glossy tablet screen):
-        * pixels that read in the contact band although nothing is there
-          (edge/occlusion/reflection/warp mismatch), and
-        * pixels whose depth is *unstable* across the empty frames (std above
-          ``noise_mm``) — flicker that would otherwise pass the motion gate.
-        Slightly dilated to cover the flicker fringe.
+        * ``max_map``: base ceiling + local slope * finger width. On an oblique
+          surface the along-ray clearance of a touching finger scales with the
+          slope, so a fixed ceiling would swallow real presses.
+        * ``min_map`` / ``motion_map``: scale with measured per-pixel noise so
+          flicker can't press, without killing whole zones.
         """
-        bad = np.zeros_like(self.artifact)
-        for f in empty_frames:
-            bad |= self._contact_band(f.astype(np.int32))
+        surf = self.surface.astype(np.float32)
+        gx = cv2.Sobel(surf, cv2.CV_32F, 1, 0, ksize=3) / 8.0   # mm per pixel
+        gy = cv2.Sobel(surf, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        slope = cv2.GaussianBlur(cv2.magnitude(gx, gy), (7, 7), 0)
+        # Holes fake huge gradients; don't loosen the ceiling near them.
+        near_hole = cv2.dilate((self.surface <= 0).astype(np.uint8),
+                               np.ones((5, 5), np.uint8)) > 0
+        slope[near_hole] = 0.0
+
+        self.max_map = np.clip(self.contact_max + SLOPE_GAIN_PX * slope,
+                               self.contact_max, MAX_BAND_CEIL_MM).astype(np.int32)
+
+        if self.noise is not None:
+            floor = np.maximum(self.contact_min,
+                               NOISE_FLOOR_GAIN * self.noise + 5.0)
+            self.min_map = np.clip(floor, self.contact_min,
+                                   NOISE_FLOOR_CAP_MM).astype(np.int32)
+            self.motion_map = np.maximum(self.motion_mm,
+                                         2.5 * self.noise).astype(np.int32)
+        else:
+            self.min_map = np.full(self.surface.shape, self.contact_min, np.int32)
+            self.motion_map = np.full(self.surface.shape, self.motion_mm, np.int32)
+
+    def calibrate_artifacts(self, empty_frames):
+        """Learn noise + artifacts from frames of the EMPTY scene.
+
+        With >=3 frames the per-pixel std becomes the noise map (adaptive
+        thresholds); only hopeless pixels (validity flicker, extreme noise) are
+        masked outright. Pixels still reading in-band while empty — systematic
+        mismatch — are masked too. Returns the masked fraction.
+        """
         if len(empty_frames) >= 3:
             stack = np.stack([f.astype(np.float32) for f in empty_frames])
             valid_all = (stack > 0).all(axis=0)
-            bad |= valid_all & (np.std(stack, axis=0) > noise_mm)
-            bad |= ~valid_all & (stack > 0).any(axis=0)   # validity flicker
+            std = np.std(stack, axis=0)
+            self.noise = np.where(valid_all, std, 0.0).astype(np.float32)
+            self.artifact |= valid_all & (std > NOISE_BROKEN_MM)
+            self.artifact |= ~valid_all & (stack > 0).any(axis=0)  # validity flicker
+            self._build_maps()  # thresholds now noise-aware
+
+        bad = np.zeros_like(self.artifact)
+        for f in empty_frames:
+            bad |= self._contact_band(f.astype(np.int32))
         if bad.any():
             bad = cv2.dilate(bad.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         self.artifact |= bad
-        return float(bad.mean())
+        return float(self.artifact.mean())
 
     def set_tiles(self, label_map, tile_ids):
         self.label_map = label_map
@@ -146,7 +191,7 @@ class PressDetector:
     def _contact_band(self, d):
         above = self.surface - d
         return ((d > 0) & (self.surface > 0) & (~self.artifact) &
-                (above >= self.contact_min) & (above <= self.contact_max))
+                (above >= self.min_map) & (above <= self.max_map))
 
     def update(self, depth_mm):
         """Feed one aligned depth frame; returns the set of tiles newly pressed."""
@@ -154,8 +199,8 @@ class PressDetector:
             return set()
         d = depth_mm.astype(np.int32)
 
-        # Motion gate: remember which pixels changed recently. On a static
-        # scene nothing has motion, so nothing can ever press.
+        # Motion gate: remember which pixels changed recently (vs their own
+        # noise level). On a static scene nothing has motion -> nothing presses.
         if self._motion_age is None:
             self._motion_age = np.zeros(d.shape, np.int16)
         else:
@@ -163,13 +208,12 @@ class PressDetector:
                         where=self._motion_age > 0)
         if self._prev is not None:
             moved = (d > 0) & (self._prev > 0) & \
-                    (np.abs(d - self._prev) > self.motion_mm)
+                    (np.abs(d - self._prev) > self.motion_map)
             self._motion_age[moved] = self.motion_hold
         self._prev = d
 
-        # Band stability: a pixel must STAY in the contact band for a couple of
-        # consecutive frames. Noise flicker jumps in and out and never qualifies;
-        # a resting fingertip does.
+        # Band stability: a pixel must STAY in the contact band for consecutive
+        # frames. Noise flicker jumps in and out; a resting fingertip doesn't.
         band = self._contact_band(d)
         if self._band_age is None:
             self._band_age = np.zeros(d.shape, np.int16)
