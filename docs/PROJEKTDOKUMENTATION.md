@@ -1,6 +1,6 @@
 # Floor-Piano — Entwicklungsdokumentation
 
-> **Studienprojekt** · Stand: **2026-07-01**
+> **Studienprojekt** · Stand: **2026-07-02**
 > Dieses Dokument protokolliert die Entwicklungsphase rund um die
 > Kamera-Integration: was analysiert, entschieden und geändert wurde, welche
 > Erkenntnisse dabei entstanden und was noch offen ist. Es ergänzt den
@@ -307,6 +307,83 @@ Empfohlene Reihenfolge bei Inbetriebnahme:
    als `TODO(hardware)` markiert; die reine Logik ist per Tests abgesichert.
 6. **Moderne Hardware vereinfacht.** Die (unerwartet neuere) Gemini 335 löste den
    größten Blocker praktisch von selbst — neuer ist hier tatsächlich besser.
+
+---
+
+## 15. Phase 2: Kamera-Inbetriebnahme, Web-UI & Play-Modus (Juli 2026)
+
+### 15.1 Inbetriebnahme der Gemini 335 (bestanden)
+- Kamera erkannt als `2bc5:0800` (USB 3), Treiber per `pip install pyorbbecsdk2`.
+  Einmalig nötig: **udev-Regeln** aus dem SDK-Paket installieren + Kamera neu
+  einstecken (sonst `openUsbDevice failed`).
+- `tools/probe_gemini.py`: **stabile 30 FPS**, 848×480, Format Y16, Depth-Scale
+  1.0 (= Millimeter) → die Echtzeit-Annahme aus Abschnitt 3 ist **live bestätigt**.
+- Eigener Live-Viewer `tools/view_gemini.py` (Tiefe eingefärbt + HUD; Umschalten
+  Tiefe/RGB/D2C-Overlay). Befund: `65535`-Werte sind der **Ungültig-Marker**
+  (0xFFFF), kein 65-m-Messwert — inzwischen wird ≥60000 überall als „keine
+  Messung" behandelt, damit weder Boden-Median noch Oberflächen-Referenz
+  vergiftet werden.
+- Beobachtung Stereo-Tiefe: **Abschattung/Okklusion** an Objektkanten (ein
+  Punkt braucht beide IR-Kameras) erklärt „doppelte" Ränder im Tiefenbild; im
+  senkrechten Aufbau über einer flachen Matte weitgehend unkritisch.
+
+### 15.2 Web-UI: Integration und Umbau (jetzt Herzstück des Projekts)
+Das vom Teamkollegen gebaute FastAPI-Web-UI (Tiles konfigurieren) wurde in
+`master` gemergt (ein einziger Entwicklungsbranch) und an die reale Nutzung
+angepasst:
+- **Kameraquelle:** Gemini-**Farbbild** über pyorbbecsdk (Tasten sind nur in
+  Farbe sichtbar), seitenverhältnis-treu auf 640×480 (Letterbox statt Verzerrung).
+- **Zuverlässige Tastenplatzierung:** Die Helligkeits-Auto-Erkennung scheiterte
+  in echten, schrägen Szenen (legte 24 Streifen übers ganze Bild). Neuer Weg:
+  **Mensch setzt/zieht die 4 Mattenecken → die 24 Tasten werden perspektivisch
+  projiziert** (`getPerspectiveTransform` + Tastenraster) — korrekt bei jedem
+  Kamerawinkel; „Auto-Ecken" liefert nur noch einen Startwert.
+- **Bugfixes:** doppelt gezeichnete Tiles (Server brannte sie zusätzlich in den
+  MJPEG-Stream), Shutdown-Tracebacks (async-Stream + CancelledError-Logfilter),
+  Klick auf eine gemalte Taste spielt ihre Note (Layout-Check per Ohr).
+
+### 15.3 Play-Modus: der Erkennungskern (Finger/Fuß → Ton)
+Getestet mit Tablet (Tastenbild) + Finger; das Tablet stand **schräg** → ein
+globaler Bodenabstand taugt nicht. Drei Iterationen bis zur robusten Lösung:
+1. **Hintergrundsubtraktion:** einmal „Oberfläche erfassen" (Median mehrerer
+   D2C-ausgerichteter Tiefenframes) → Pro-Pixel-Referenz; funktioniert bei jeder
+   Neigung. (D2C: Tiefe wird per SDK-`AlignFilter` aufs Farbbild gerechnet und
+   identisch geletterboxt → Tiefen-Pixel == Tile-Koordinaten.)
+2. **Problem „Hand drüber löst aus"** → **Kontakt-Band**: ein Druck ist nur, was
+   ~5–30 mm **an** der Fläche liegt (Fingerspitze); Schwebendes ist höher → stumm.
+3. **Problem „alle Tasten feuern"** (verrauschte/verschobene Referenz driftet
+   ins Band) → **Blob-Erkennung** wie im Tiefen-Piano: nur fingergroße
+   zusammenhängende Flächen zählen (zu klein = Rauschen, zu groß = Drift →
+   verworfen), jeder Blob feuert genau **eine** Taste.
+
+Trigger laufen server-seitig, der Browser pollt sie, blinkt das Tile und spielt
+die Note (`/sounds`-Samples). Edge-Trigger + Release-Debounce verhindern
+Dauerfeuer. Stellschrauben: `webui/depth_detect.py`
+(`DEFAULT_CONTACT_MIN/MAX_MM`, `DEFAULT_MIN_BLOB_PX`, `DEFAULT_MAX_BLOB_FRAC`).
+
+### 15.4 Projekt-Hygiene
+- **Ein** Branch (`master`), alle Feature-Branches gemergt und gelöscht.
+- **Eine** Abhängigkeitsliste: `requirements.txt` konsolidiert (Core + Kamera +
+  Web-UI + Tests); `pyproject.toml` gefüllt → `uv sync` / `uv run` funktionieren.
+- Teststand: **174 pytest**, alle grün (inkl. Kontakt-Band-, Hover-, Drift- und
+  Blob-Fällen mit synthetischen Tiefenbildern).
+
+### 15.5 Lessons Learned (Phase 2)
+1. **Auto-Erkennung braucht den Menschen im Loop:** 4 Ecken manuell setzen ist
+   robuster als jede Helligkeits-Heuristik — und die Mathematik (perspektivische
+   Projektion) erledigt den Rest.
+2. **„Vor der Fläche" ≠ „auf der Fläche":** Erst das Kontakt-Band macht aus
+   Tiefen-Daten eine Berührung; erst Blobs machen daraus einen Finger.
+3. **Referenzen altern:** Verrutscht Kamera oder Fläche, muss die
+   Oberflächen-Referenz neu erfasst werden — im UI bewusst ein Ein-Klick-Schritt.
+4. **Harte Prozess-Kills vermeiden:** `kill -9` während des USB-Streams warf die
+   Kamera vom Bus; sauberes Ctrl-C genügt.
+
+### 15.6 Offen für den Abschluss
+- Schwellen-Feintuning an der **echten Matte** (statt Tablet).
+- Deployment am Pi: systemd-Service für `webui.server` + Hotspot-Einrichtung.
+- Optional: Standalone-Pfad (`src/main.py`) an die Web-UI-Tiles anbinden, falls
+  Pi-Lautsprecher-Ausgabe ohne Browser gewünscht ist.
 
 ---
 

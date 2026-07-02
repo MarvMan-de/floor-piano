@@ -1,7 +1,20 @@
 [project]
 name = "floor-piano"
-version = "0.1.0"
-description = "Add your description here"
+version = "2.0.0"
+description = "Interactive floor piano: Orbbec Gemini 335 depth camera + Raspberry Pi 5, configured and played through a web UI"
 readme = "README.md"
-requires-python = ">=3.8"
-dependencies = []
+requires-python = ">=3.9"
+# Mirrors requirements.txt (kept for plain-pip users). With uv:
+#   uv sync            # create .venv + install everything
+#   uv run python -m webui.server --port 8000
+dependencies = [
+    "opencv-contrib-python>=4.7",   # MUST be contrib (cv2.aruco)
+    "numpy",
+    "pygame",
+    "pyorbbecsdk2>=2.0",            # imports as 'pyorbbecsdk'; x86_64 + arm64 wheels
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "aiofiles>=23.0.0",
+    "python-multipart>=0.0.9",
+    "pytest",
+]

@@ -56,7 +56,12 @@ def decode_depth(raw_bytes, height, width):
         return None
     # .copy() so we own a contiguous, writable array: the camera SDK may recycle
     # its frame buffer on the next read, and numpy 2.x is strict about contiguity.
-    return np.frombuffer(raw_bytes, dtype=np.uint16).reshape((height, width)).copy()
+    depth = np.frombuffer(raw_bytes, dtype=np.uint16).reshape((height, width)).copy()
+    # Some devices (Gemini 335, seen live) mark invalid/overflow pixels as
+    # 0xFFFF instead of 0. Fold those into the documented 0 = "no reading"
+    # sentinel so floor medians and trigger masks never see bogus 65-m values.
+    depth[depth >= 60000] = 0
+    return depth
 
 
 # --- triggering ------------------------------------------------------------

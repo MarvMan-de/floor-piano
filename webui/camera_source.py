@@ -287,7 +287,11 @@ class MediaSource:
         raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
         if raw.size != w * h:
             return
-        depth = _letterbox(raw.reshape(h, w), self.width, self.height)
+        depth = _letterbox(raw.reshape(h, w), self.width, self.height).copy()
+        # The Gemini marks invalid/overflow pixels as 0xFFFF (seen live as
+        # "max 65535 mm"). Map those to 0 ("no reading") so they can't poison
+        # the captured surface reference or the contact-band detection.
+        depth[depth >= 60000] = 0
         with self._lock:
             self._depth = depth
 

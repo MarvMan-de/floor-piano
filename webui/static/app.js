@@ -66,6 +66,7 @@ const state = {
 
   // Play/test mode: server does depth finger-detection, browser plays the notes
   playMode: false,
+  surfaceReady: false,   // step 2 done: empty-surface depth reference captured
   _playInterval: null,
 };
 
@@ -395,6 +396,8 @@ async function captureSurface() {
     const res = await fetch("/api/capture_surface", { method: "POST" });
     if (!res.ok) throw new Error((await res.json()).detail || "capture failed");
     const data = await res.json();
+    state.surfaceReady = true;
+    updateSteps();
     setStatus(`Oberfläche erfasst (${Math.round((data.valid_frac || 0) * 100)}% gültig) `
               + "— jetzt Tasten drücken", "ok");
   } catch (err) {
@@ -411,7 +414,8 @@ async function togglePlayMode() {
     });
     const data = await res.json().catch(() => ({}));
     state.playMode = on;
-    if (btnPlay) btnPlay.textContent = on ? "⏹ Stop" : "▶ Play";
+    if (data && typeof data.surface_ready === "boolean") state.surfaceReady = data.surface_ready;
+    updateSteps();
     clearInterval(state._playInterval);
     state._playInterval = null;
     if (on) {
@@ -444,7 +448,7 @@ function setMode(newMode) {
   if (newMode === "LIVE") {
     // Always reconnect the MJPEG stream when going live
     feedEl.src = "/video_feed";
-    btnFreeze.textContent = "Freeze";
+    btnFreeze.textContent = "Standbild";
     clearDrawPreview();
     state.drawVertices = [];
     state.selectedId = null;
@@ -456,7 +460,7 @@ function setMode(newMode) {
     }
     renderAll();
   } else if (newMode === "FREEZE") {
-    btnFreeze.textContent = "Go Live";
+    btnFreeze.textContent = "Live";
     if (isVideo) {
       // Video mode: pause the stream; MJPEG keeps showing last frame
       if (prevMode === "LIVE") {
@@ -471,7 +475,7 @@ function setMode(newMode) {
     }
   } else {
     // DRAW / SELECT inherit freeze state
-    btnFreeze.textContent = "Go Live";
+    btnFreeze.textContent = "Live";
   }
 
   if (newMode === "DRAW") {
@@ -502,6 +506,19 @@ function renderAll() {
   renderSuggestions();
   renderSidebar();
   renderPropsPanel();
+  updateSteps();
+}
+
+// Reflect workflow progress on the three step keys in the top bar: a finished
+// step stays visually pressed; the Play key glows while play mode is on.
+function updateSteps() {
+  if (btnPlaceCorners) btnPlaceCorners.classList.toggle("done", state.tiles.length > 0);
+  if (btnCaptureSurface) btnCaptureSurface.classList.toggle("done", state.surfaceReady);
+  if (btnPlay) {
+    btnPlay.classList.toggle("live", state.playMode);
+    const name = btnPlay.querySelector(".step-name");
+    if (name) name.textContent = state.playMode ? "Stop" : "Spielen";
+  }
 }
 
 function renderCorners() {
@@ -638,7 +655,7 @@ function renderSidebar() {
 
 function renderPropsPanel() {
   if (state.selectedId === null) {
-    propsForm.innerHTML = '<p class="hint">Select a tile to edit its properties.</p>';
+    propsForm.innerHTML = '<p class="hint">Taste anklicken, um sie zu bearbeiten.</p>';
     return;
   }
   const tile = state.tiles.find(t => t.id === state.selectedId);

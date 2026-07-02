@@ -1,117 +1,138 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Floor Piano — Tile Config</title>
+  <title>Floor Piano</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div id="app">
 
-    <!-- Left sidebar -->
-    <aside id="sidebar">
+    <!-- Top bar: wordmark · the 3 workflow steps as piano keys · mode LED -->
+    <header id="topbar">
+      <div id="wordmark">Floor<b>Piano</b></div>
 
-      <!-- Source selector -->
-      <div id="source-section">
-        <h2>Source</h2>
-        <div class="source-radios">
-          <label class="radio-label">
-            <input type="radio" name="source-type" value="camera" checked />
-            Live Camera
-          </label>
-          <label class="radio-label">
-            <input type="radio" name="source-type" value="video" />
-            Video File
-          </label>
+      <nav id="steps" aria-label="Arbeitsschritte">
+        <button id="btn-place-corners" class="step-key" data-step="1"
+                title="Die 4 Mattenecken im Bild anklicken — die 24 Tasten folgen">
+          <span class="step-num">1</span>
+          <span class="step-name">Ecken setzen</span>
+        </button>
+        <button id="btn-capture-surface" class="step-key" data-step="2"
+                title="Leere Oberfläche als Tiefen-Referenz erfassen (ohne Finger/Füße)">
+          <span class="step-num">2</span>
+          <span class="step-name">Oberfläche erfassen</span>
+        </button>
+        <button id="btn-play" class="step-key" data-step="3"
+                title="Tasten drücken → Ton">
+          <span class="step-num">3</span>
+          <span class="step-name">Spielen</span>
+        </button>
+      </nav>
+
+      <span id="mode-label" class="mode-badge">LIVE</span>
+    </header>
+
+    <div id="workspace">
+
+      <!-- Left: source + tile list -->
+      <aside id="sidebar">
+        <div id="source-section">
+          <h2>Quelle</h2>
+          <div class="source-radios">
+            <label class="radio-label">
+              <input type="radio" name="source-type" value="camera" checked />
+              Kamera (live)
+            </label>
+            <label class="radio-label">
+              <input type="radio" name="source-type" value="video" />
+              Videodatei
+            </label>
+          </div>
+          <div id="video-file-row" style="display:none">
+            <select id="video-file-select">
+              <option value="">— keine Videos gefunden —</option>
+            </select>
+          </div>
         </div>
-        <div id="video-file-row" style="display:none">
-          <select id="video-file-select">
-            <option value="">— no videos found —</option>
+
+        <h2>Tasten</h2>
+        <ul id="tile-list"></ul>
+      </aside>
+
+      <!-- Center: camera feed + SVG overlay -->
+      <main id="canvas-panel">
+        <div id="feed-wrap">
+          <div id="feed-container">
+            <img id="feed" alt="Kamerabild" />
+            <svg id="overlay"
+                 viewBox="0 0 640 480"
+                 preserveAspectRatio="none"
+                 xmlns="http://www.w3.org/2000/svg">
+              <g id="tiles-layer"></g>
+              <g id="suggestions-layer"></g>
+              <g id="handles-layer"></g>
+              <g id="corners-layer"></g>
+              <polyline id="draw-preview" fill="none" stroke="#fff"
+                        stroke-width="1.5" stroke-dasharray="6 3"
+                        pointer-events="none" />
+              <line id="draw-cursor-line" stroke="#fff" stroke-width="1"
+                    stroke-dasharray="4 3" pointer-events="none" />
+              <g id="draw-handles-layer"></g>
+            </svg>
+          </div>
+          <!-- Resize grips live outside the (rotatable) container so they always
+               stay screen-aligned; positioned on the feed's edges by layoutFeed(). -->
+          <div class="resize-handle e"  data-axis="x"  title="Breite ziehen"></div>
+          <div class="resize-handle s"  data-axis="y"  title="Höhe ziehen"></div>
+          <div class="resize-handle se" data-axis="xy" title="Größe ziehen · Doppelklick: Originalformat"></div>
+        </div>
+
+        <!-- Toolbar -->
+        <div id="toolbar">
+          <button id="btn-freeze">Standbild</button>
+          <button id="btn-rotate" title="Ansicht um 90° drehen">&#8635; Drehen</button>
+          <div class="spacer"></div>
+          <div id="suggestion-actions" style="display:none">
+            <button id="btn-accept-all">Alle übernehmen</button>
+            <button id="btn-reject-all">Alle verwerfen</button>
+          </div>
+          <span id="status-msg"></span>
+          <div class="spacer"></div>
+          <button id="btn-save" class="primary">Speichern</button>
+          <button id="btn-discard">Verwerfen</button>
+        </div>
+
+        <!-- Video playback controls (hidden in camera mode) -->
+        <div id="video-controls" style="display:none">
+          <button id="btn-play-pause" class="play-btn">&#9654; Play</button>
+          <span id="time-current" class="time-stamp">0:00</span>
+          <input id="timeline" type="range" min="0" max="1000" value="0" step="1" />
+          <span id="time-total" class="time-stamp">0:00</span>
+          <select id="speed-select" class="speed-select">
+            <option value="0.25">0.25×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
           </select>
         </div>
-      </div>
+      </main>
 
-      <!-- Tile list -->
-      <h2>Tiles</h2>
-      <ul id="tile-list"></ul>
-    </aside>
-
-    <!-- Center: camera feed + SVG overlay -->
-    <main id="canvas-panel">
-      <div id="feed-wrap">
-        <div id="feed-container">
-          <img id="feed" alt="camera feed" />
-          <svg id="overlay"
-               viewBox="0 0 640 480"
-               preserveAspectRatio="none"
-               xmlns="http://www.w3.org/2000/svg">
-            <g id="tiles-layer"></g>
-            <g id="suggestions-layer"></g>
-            <g id="handles-layer"></g>
-            <g id="corners-layer"></g>
-            <polyline id="draw-preview" fill="none" stroke="#fff"
-                      stroke-width="1.5" stroke-dasharray="6 3"
-                      pointer-events="none" />
-            <line id="draw-cursor-line" stroke="#fff" stroke-width="1"
-                  stroke-dasharray="4 3" pointer-events="none" />
-            <g id="draw-handles-layer"></g>
-          </svg>
+      <!-- Right: secondary tools + tile properties -->
+      <aside id="props-panel">
+        <h2>Werkzeuge</h2>
+        <div class="props-actions">
+          <button id="btn-autodetect" title="Mattenecken automatisch vorschlagen">&#x26B2; Auto-Ecken</button>
+          <button id="btn-add-draw" title="Eine Taste frei einzeichnen">+ Taste zeichnen</button>
         </div>
-        <!-- Resize grips live outside the (rotatable) container so they always
-             stay screen-aligned; positioned on the feed's edges by layoutFeed(). -->
-        <div class="resize-handle e"  data-axis="x"  title="Breite ziehen"></div>
-        <div class="resize-handle s"  data-axis="y"  title="Höhe ziehen"></div>
-        <div class="resize-handle se" data-axis="xy" title="Größe ziehen · Doppelklick: Originalformat"></div>
-      </div>
-
-      <!-- Toolbar -->
-      <div id="toolbar">
-        <button id="btn-freeze">Freeze</button>
-        <span id="mode-label" class="mode-badge">LIVE</span>
-        <button id="btn-rotate" title="Rotate view 90°">&#8635; Rotate</button>
-        <div class="spacer"></div>
-        <button id="btn-capture-surface" title="Leere Oberfläche als Referenz erfassen (ohne Finger)">&#9678; Oberfläche erfassen</button>
-        <button id="btn-play" class="primary" title="Finger-Tasten spielen">&#9654; Play</button>
-        <div class="spacer"></div>
-        <div id="suggestion-actions" style="display:none">
-          <button id="btn-accept-all">Accept All</button>
-          <button id="btn-reject-all">Reject All</button>
+        <h2>Eigenschaften</h2>
+        <div id="props-form">
+          <p class="hint">Taste anklicken, um sie zu bearbeiten.</p>
         </div>
-        <div class="spacer"></div>
-        <button id="btn-save" class="primary">Save</button>
-        <button id="btn-discard">Discard</button>
-        <span id="status-msg"></span>
-      </div>
+      </aside>
 
-      <!-- Video playback controls (hidden in camera mode) -->
-      <div id="video-controls" style="display:none">
-        <button id="btn-play-pause" class="play-btn">&#9654; Play</button>
-        <span id="time-current" class="time-stamp">0:00</span>
-        <input id="timeline" type="range" min="0" max="1000" value="0" step="1" />
-        <span id="time-total" class="time-stamp">0:00</span>
-        <select id="speed-select" class="speed-select">
-          <option value="0.25">0.25×</option>
-          <option value="0.5">0.5×</option>
-          <option value="1" selected>1×</option>
-          <option value="2">2×</option>
-        </select>
-      </div>
-    </main>
-
-    <!-- Right panel: actions + tile properties -->
-    <aside id="props-panel">
-      <div class="props-actions">
-        <button id="btn-place-corners" class="primary">&#9633; Mat-Ecken setzen</button>
-        <button id="btn-autodetect">&#x26B2; Auto-Ecken</button>
-        <button id="btn-add-draw">+ Draw Tile</button>
-      </div>
-      <h2>Properties</h2>
-      <div id="props-form">
-        <p class="hint">Select a tile to edit its properties.</p>
-      </div>
-    </aside>
-
+    </div>
   </div>
   <script src="/static/app.js"></script>
 </body>

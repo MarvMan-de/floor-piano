@@ -1,95 +1,92 @@
-# 🎹 Floor Piano v2.0
+# 🎹 Floor Piano
 
-Interactive floor piano system for a Raspberry Pi 5 + Orbbec Astra Pro (3D depth camera) hardware stack.
+Interactive floor piano: an **Orbbec Gemini 335** depth camera watches a printed
+piano mat (or, while testing, a tablet showing the keys); stepping/pressing on a
+key plays its note. Runs on a **Raspberry Pi 5**, configured and played through a
+**web UI** reachable over the Pi's hotspot.
 
-## 🚀 Features
+## 🚀 How it works
 
-- **24-Key Keyboard**: 2 full octaves — 14 white + 10 black keys (C4–B5), with a real
-  piano layout (black keys narrower, at the back, none between E–F or B–C)
-- **3D Depth Triggering**: Low-latency foot detection using Orbbec Astra Pro depth sensing,
-  restricted to a press-height band so bodies passing OVER the mat stay silent
-- **Blob Detection**: one foot presses exactly one key (majority overlap + boundary
-  hysteresis) — no double notes on key edges, while two feet still play chords;
-  releases are debounced so noise can't retrigger held notes
-- **Calibration without markers**: ArUco markers *or* the printed mat itself — corners,
-  orientation and a sub-pixel grid refinement are derived from the painted keys
-  (verified against real video to ±0.5 px)
-- **Low-Latency Audio**: PyGame audio engine with per-note samples (32 mixer channels,
-  recovers automatically when the USB soundcard comes up late)
-- **Auto-Leveling**: Floor depth sampled (median) at calibration, re-levelable live (RANSAC plane-fit planned — see VERSION_2_PLAN)
+1. **Web UI** (the heart of the project): shows the live camera image, you place
+   the mat's 4 corners and the 24 keys are perspective-projected onto them.
+2. **Capture surface**: one click stores the empty surface as a per-pixel depth
+   reference — works even when the surface is tilted.
+3. **Play**: a press is a finger/foot-sized *blob* of pixels right **at** the
+   surface (thin contact band above the reference). A hand or body passing over
+   the keys is higher and stays silent. Triggered notes flash in the UI and play
+   in the browser.
+
+## 🛠 Quick Start
+
+```bash
+# with uv (recommended)
+uv sync
+uv run python -m webui.server --port 8000
+
+# or with plain pip
+pip install -r requirements.txt
+python -m webui.server --port 8000
+```
+
+Open **http://localhost:8000** (or `http://<pi-ip>:8000` from a phone on the
+Pi's hotspot), then:
+
+1. **Mat-Ecken setzen** — click the mat's 4 corners → 24 keys appear (drag the
+   corner handles to fine-tune; the keys follow, perspective-correct).
+2. **Oberfläche erfassen** — with no fingers/feet in view.
+3. **Play** — press the keys; the browser plays the notes.
+
+First time with the camera on Linux: install the udev rules once, then re-plug:
+
+```bash
+sudo sh .venv/lib/python*/site-packages/pyorbbecsdk/shared/install_udev_rules.sh
+```
 
 ## 📁 Project Structure
 
 ```
 floor-piano/
-├── src/                    # Source code
-│   ├── main.py            # Main piano application
-│   ├── audio.py           # Audio engine
-│   ├── calibrate.py       # Automatic calibration
-│   └── sounds/            # Audio samples
-├── docs/                  # Documentation
-│   ├── SETUP.md          # Hardware setup guide
-│   ├── SHOPPING_LIST.md  # Required components
-│   └── VERSION_2_PLAN.md # Development roadmap
-├── requirements.txt      # Python dependencies
-└── README.md            # This file
+├── webui/                  # The web app (FastAPI + vanilla JS) — config + play
+│   ├── server.py          # API: tiles, corners, surface capture, play mode, MJPEG
+│   ├── camera_source.py   # Gemini colour + D2C-aligned depth (pyorbbecsdk)
+│   ├── depth_detect.py    # contact-band + blob press detection
+│   └── static/            # index.html, app.js, style.css
+├── src/                    # Standalone depth pipeline + shared logic
+│   ├── main.py            # Headless piano (keyboard-grid path, pygame audio)
+│   ├── detection.py       # Hardware-free trigger logic (unit-tested)
+│   ├── calibrate.py       # ArUco / printed-mat calibration for the src path
+│   ├── mat_calibration.py # Marker-less mat detection (corners from painted keys)
+│   ├── placement.py       # Camera-placement coach (structured hints)
+│   └── sounds/            # Note samples (C4–B5, generate_samples.py)
+├── tools/                  # probe_gemini.py / view_gemini.py (live depth checks)
+├── tests/                  # pytest suite (hardware-free)
+└── docs/                   # Setup guides, project documentation, code review
 ```
 
-## 🛠 Quick Start
+## 🧪 Tests
 
-1. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. **Generate Audio Samples** (offline, no download needed):
-   ```bash
-   python src/sounds/generate_samples.py
-   ```
-
-3. **Calibrate System**:
-   ```bash
-   python src/calibrate.py
-   ```
-
-4. **Run Piano**:
-   ```bash
-   python src/main.py
-   ```
-
-## 🧪 Development & Tests
-
-The trigger logic lives in `src/detection.py` and is hardware-free, so it can be
-tested without a camera:
+All detection logic is hardware-free and covered by the suite:
 
 ```bash
-pip install -r requirements.txt
-pytest
+uv run pytest        # or: pytest
 ```
 
-## 📋 Hardware Requirements
+## 📋 Hardware
 
-- Raspberry Pi 5 (8GB RAM)
-- Orbbec Astra Pro 3D Camera
-- Official Raspberry Pi 27W Power Supply
-- USB Audio Adapter
+- Raspberry Pi 5 (8 GB — far more than needed; detection costs ~10 ms/frame)
+- **Orbbec Gemini 335** (USB 3.0; depth FOV 90°×65°, so a 2 m mat fits from
+  ~1.1–1.2 m mounting height)
+- USB audio adapter / speakers (for standalone `src/main.py` playback)
 
-## 🎯 Performance Targets
+Legacy note: an original Orbbec Astra (OpenNI2) is still supported as a fallback
+via `FLOOR_PIANO_CAMERA=openni2` — see `docs/ASTRA_PI5_SETUP.md`.
 
-- **~30 FPS**: Real-time depth processing (Astra Pro depth-stream limit)
-- **Low latency**: ~40–80 ms from foot contact to audio playback
-- **Auto-Recovery**: Floor level can be re-sampled on the fly if the camera is bumped
+## 🔧 Status
 
-## 🔧 Development Status
+- ✅ Gemini 335 live at 30 FPS (format/scale verified with `tools/probe_gemini.py`)
+- ✅ Web UI: corner-based key placement, click-to-play, depth Play mode
+- ✅ Touch = contact band + blob detection (hover/pass-over stays silent)
+- 🚧 Threshold tuning on the real mat (`webui/depth_detect.py` constants)
+- 🚧 Pi hotspot deployment (systemd service for `webui.server`)
 
-**Version 2.0** - Professional Headless Edition
-- ✅ 3D Depth Triggering (pyorbbecsdk)
-- ✅ ArUco Marker Calibration
-- ✅ Low-Latency Audio Engine
-- 🚧 Systemd Service
-- 🚧 GPIO Status Indicators
-- 💤 Hailo-8L Pose Integration (deferred — not part of the current hardware plan)
-
----
-
-*Built for professional interactive installations and exhibitions*
+Full development log: `docs/PROJEKTDOKUMENTATION.md` · review: `docs/CODE_REVIEW.md`
