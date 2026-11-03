@@ -60,6 +60,8 @@ MAX_BAND_CEIL_MM = 80          # never accept more than this above the surface â
 NOISE_FLOOR_GAIN = 3.0         # band floor = max(base, gain*noise + 5)
 NOISE_FLOOR_CAP_MM = 30        # band floor never exceeds this (else zone ~dead)
 NOISE_BROKEN_MM = 30           # std above this = hopeless pixel -> artifact
+ARTIFACT_INBAND_FRAC = 0.25      # share of empty frames a pixel must sit in-band to
+                               # count as a systematic artifact (not a noise blip)
 
 # --- plane fallback (rescue of unusable reference pixels) -------------------
 PLANE_TOL_MM = 15              # measured ref within this of the plane = usable
@@ -355,9 +357,14 @@ class PressDetector:
             self._raw_artifact = self._raw_artifact | (~valid_all & (stack > 0).any(axis=0))  # validity flicker
             self._build_maps()  # thresholds now noise-aware
 
-        bad = np.zeros_like(self._raw_artifact)
+        # Systematic mismatch = in the contact band in a good share of the
+        # empty frames. ONE noise excursion must not kill a pixel: on dark
+        # glossy print (black keys, sigma ~8-15mm) nearly every pixel pokes into
+        # the band once in 25 frames, which used to mask whole keys dead.
+        hits = np.zeros(self._raw_artifact.shape, np.int32)
         for f in empty_frames:
-            bad |= self._contact_band(f.astype(np.int32))
+            hits += self._contact_band(f.astype(np.int32))
+        bad = hits >= max(2, int(np.ceil(ARTIFACT_INBAND_FRAC * len(empty_frames))))
         if bad.any():
             bad = cv2.dilate(bad.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
         self._raw_artifact = self._raw_artifact | bad
@@ -406,7 +413,11 @@ class PressDetector:
         plane_z = plane_depth_map(fit["coef"], meas.shape)
         usable = (meas > 0) & ~raw & (np.abs(meas - plane_z) <= PLANE_TOL_MM)
         if mat is not None:
-            domain = mat
+            # rescue only ON the keys (+2px): the wider fit domain also holds
+            # floor beyond the mat edge, where the plane is wrong and a foot
+            # over the real floor would read "in contact" with it
+            domain = cv2.dilate((self.label_map >= 0).astype(np.uint8),
+                                np.ones((5, 5), np.uint8)) > 0
         else:   # no tiles yet: the hull of the good pixels (keeps letterbox out)
             pts = cv2.findNonZero(cand.astype(np.uint8))
             domain = np.zeros(meas.shape, np.uint8)
@@ -700,6 +711,8 @@ class PressDetector:
         # covers the narrow black key far more than the foot's bulk covers
         # the wide white beside it.
         for options in best_by_obj.values():
+            if not options:   # blob split into specks, none big enough on any tile
+                continue
             best = max(options,
                        key=lambda ct: (self._streak.get(ct[1], 0), ct[0]))
             hits.add(best[1])

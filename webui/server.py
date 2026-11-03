@@ -8,6 +8,7 @@ Run:
 
 import asyncio
 import logging
+import os
 import queue
 import sys
 import time
@@ -267,7 +268,8 @@ async def capture_surface() -> JSONResponse:
         raise HTTPException(status_code=503,
                             detail="No depth frames — is the Orbbec connected and streaming?")
     surface = np.median(np.stack(grabbed), axis=0).astype(np.uint16)
-    det = PressDetector(surface)
+    # plane fallback is opt-in until verified on real recordings
+    det = PressDetector(surface, plane_fallback=os.environ.get("FLOOR_PIANO_PLANE") == "1")
     _detector = det
     _rebuild_label_map()   # tiles first: the plane fit is restricted to the mat
     extra = await _grab_depth_frames(8, loop)

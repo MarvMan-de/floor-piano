@@ -567,3 +567,20 @@ def test_render_debug_tints_rescued_magenta():
     img = det.render_debug(live)
     px = img[110, 110].astype(int)            # B, G, R
     assert px[2] > px[1] and px[0] > px[1]
+
+
+def test_noise_excursions_do_not_mask_pixels_but_systematic_inband_does():
+    """Dark glossy print (black keys, sigma ~10mm) pokes into the contact band
+    in a single empty frame now and then — that must not kill the pixel. A
+    pixel that sits in-band in many empty frames is a real artifact."""
+    surf = _flat()
+    rng = np.random.default_rng(5)
+    frames = []
+    for _ in range(20):
+        f = surf.astype(np.int32) + np.round(rng.normal(0, 10, surf.shape)).astype(np.int32)
+        f[60:100, 60:100] -= 25                 # systematic: always in-band
+        frames.append(np.clip(f, 1, 65535).astype(np.uint16))
+    det = _detector([_tile(1, 0, 0, 640, 480)], surf)
+    det.calibrate_artifacts(frames)
+    assert det.artifact[80, 80]                 # systematic -> masked
+    assert det.artifact[200:400, 100:500].mean() < 0.02   # noise only -> alive
