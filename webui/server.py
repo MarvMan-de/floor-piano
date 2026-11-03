@@ -20,10 +20,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from webui.autodetect import detect_corners, detect_tiles, tiles_from_corners
+from webui.autodetect import (detect_corners, detect_tiles, flip_corners,
+                              order_corners, tiles_from_corners)
 from webui.camera_source import MediaSource
 from webui.depth_detect import (DepthHitTracker, PressDetector,
-                               build_tile_label_map)
+                               build_tile_label_map, render_semantic)
 from webui.tile_store import default_tiles_doc, load_tiles, save_tiles, validate_tiles_doc
 from webui.video_detect import detect_tile_hits
 
@@ -31,6 +32,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 _STATIC_DIR = Path(__file__).parent / "static"
 _SOUNDS_DIR = _REPO_ROOT / "src" / "sounds"
 _DEMO_DIR = _REPO_ROOT / "demo"
+_BAG_DIR = _REPO_ROOT / "video"
 _VIDEO_EXTS = ("*.mp4", "*.avi", "*.mov", "*.mkv")
 
 app = FastAPI(title="Floor Piano WebUI")
@@ -158,13 +160,16 @@ def _make_detection_cb():
         if not tiles:
             return
         src = _media._source_type if _media else None
-        if src == "orbbec":
+        if src in ("orbbec", "bag"):
             if _detector is None:
                 return  # surface not captured yet
-            depth = _media.read_depth_aligned()
-            if depth is None or depth.shape != _detector.surface.shape:
-                return
-            fired = _detector.update(depth)   # motion-gated, confirmed, edge-triggered
+            fired = set()
+            # process EVERY aligned depth frame since the last callback — a
+            # skipped frame can swallow the single first-contact frame of a
+            # toe landing on a key boundary
+            for depth in _media.drain_depth_aligned():
+                if depth.shape == _detector.surface.shape:
+                    fired |= _detector.update(depth)
         elif src == "video" and _video_tracker is not None:
             fired = _video_tracker.update(set(detect_tile_hits(frame, tiles)))
         else:
@@ -273,6 +278,46 @@ async def capture_surface() -> JSONResponse:
                          "artifact_frac": round(artifact_frac, 3)})
 
 
+@app.post("/api/capture_feet")
+async def capture_feet(request: Request) -> JSONResponse:
+    """Calibrate the contact tolerance from the player's own feet.
+
+    The player STANDS still on the captured surface; the detector measures the
+    shoe-top height (contact is guaranteed while standing) and sets the band
+    ceiling to it + margin. Thick sneakers get the reach they need; bare feet
+    get a tighter band than the default. Requires a captured surface.
+
+    Optional body {"ceiling_mm": N} sets the ceiling directly (25..120 mm)
+    without measuring — for recordings without a standing segment."""
+    if _detector is None:
+        raise HTTPException(status_code=409,
+                            detail="Zuerst die Oberfläche erfassen (ohne Füße)")
+    if _media is None:
+        raise HTTPException(status_code=503, detail="Media source not ready")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    manual = body.get("ceiling_mm")
+    if manual is not None:
+        mm = int(np.clip(int(manual), 25, 120))
+        _detector.contact_max = mm
+        _detector._build_maps()
+        return JSONResponse({"ok": True, "touch_ceiling_mm": mm, "manual": True})
+    _media.set_detect(True)
+    loop = asyncio.get_event_loop()
+    frames = await _grab_depth_frames(10, loop)
+    if not frames:
+        raise HTTPException(status_code=503, detail="No depth frames")
+    mm = await loop.run_in_executor(None, _detector.calibrate_touch, frames)
+    if mm is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Keine Füße erkannt — mit beiden Füßen auf die Matte stellen "
+                   "und still stehen")
+    return JSONResponse({"ok": True, "touch_ceiling_mm": mm})
+
+
 # ---------------------------------------------------------------------------
 # Camera / snapshot API
 # ---------------------------------------------------------------------------
@@ -297,7 +342,8 @@ async def autodetect() -> JSONResponse:
     frame = await loop.run_in_executor(None, _media.read_frame if _media else lambda: None)
     if frame is None:
         raise HTTPException(status_code=503, detail="Camera not ready")
-    suggestions = detect_tiles(frame)
+    # detection is CPU-heavy (hundreds of ms on the Pi) — keep the loop free
+    suggestions = await loop.run_in_executor(None, detect_tiles, frame)
     return JSONResponse({"suggestions": suggestions})
 
 
@@ -309,7 +355,8 @@ async def detect_corners_api() -> JSONResponse:
     frame = await loop.run_in_executor(None, _media.read_frame if _media else lambda: None)
     if frame is None:
         raise HTTPException(status_code=503, detail="Camera not ready")
-    corners = detect_corners(frame)
+    # detection is CPU-heavy (hundreds of ms on the Pi) — keep the loop free
+    corners = await loop.run_in_executor(None, detect_corners, frame)
     return JSONResponse({"corners": corners})
 
 
@@ -317,19 +364,39 @@ async def detect_corners_api() -> JSONResponse:
 async def generate_tiles(request: Request) -> JSONResponse:
     """Project the 24 piano keys onto a user-provided 4-corner mat quad.
 
-    Body: {"corners": [[x,y]x4] in TL,TR,BR,BL, "num_white"?: int}.
+    Body: {"corners": [[x,y]x4] in ANY order, "num_white"?: int,
+           "flip_h"?: bool, "flip_v"?: bool}.
     This is the reliable path: the human places/drags the corners, the keys
-    follow perspective-correctly. Returns {"tiles": [{polygon,label,note}, ...]}.
+    follow perspective-correctly. The corners are ordered and oriented HERE,
+    against the live frame's black-key pattern (a client-side sum/diff sort
+    mislabels oblique quads and collapses the projection) — the client sends
+    its points as clicked. When the mat lies KEYS-DOWN (blank back up) no
+    pattern is visible: orientation falls back to screen geometry and the
+    user's flip_h (swap the C4 end) / flip_v (black keys along the other long
+    edge) are applied on top. Returns {"tiles": [...], "corners": [[x,y]x4],
+    "oriented_by": "pattern"|"geometry"}.
     """
     body = await request.json()
     corners = body.get("corners")
     if not isinstance(corners, list) or len(corners) != 4:
         raise HTTPException(status_code=422, detail="corners must be 4 [x, y] points")
+    loop = asyncio.get_event_loop()
+    frame = await loop.run_in_executor(None, _media.read_frame if _media else lambda: None)
+
+    def _order_and_project():
+        ordered, how = order_corners(corners, frame, body.get("num_white"))
+        ordered = flip_corners(ordered, bool(body.get("flip_h")),
+                               bool(body.get("flip_v")))
+        return ordered, how, tiles_from_corners(ordered, body.get("num_white"))
+
     try:
-        tiles = tiles_from_corners(corners, body.get("num_white"))
+        # runs per drag tick (~120 ms debounce) and costs tens of ms — keep it
+        # off the event loop so the MJPEG stream stays smooth
+        ordered, how, tiles = await loop.run_in_executor(None, _order_and_project)
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return JSONResponse({"tiles": tiles})
+    return JSONResponse({"tiles": tiles, "corners": ordered.tolist(),
+                         "oriented_by": how})
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +411,16 @@ async def get_sources() -> JSONResponse:
         for ext in _VIDEO_EXTS:
             for p in sorted(_DEMO_DIR.glob(ext)):
                 videos.append(str(p.relative_to(_REPO_ROOT)))
-    return JSONResponse({"depth_camera": True, "cameras": [0], "videos": videos})
+    # Orbbec .bag recordings (colour + depth) — play through the FULL depth
+    # pipeline: mark the tiles on the first frame, then play as with the live
+    # camera.
+    bags = []
+    for bag_dir in (_BAG_DIR, _DEMO_DIR):
+        if bag_dir.exists():
+            for p in sorted(bag_dir.glob("*.bag")):
+                bags.append(str(p.relative_to(_REPO_ROOT)))
+    return JSONResponse({"depth_camera": True, "cameras": [0],
+                         "videos": videos, "bags": bags})
 
 
 @app.post("/api/source")
@@ -354,16 +430,17 @@ async def set_source(request: Request) -> JSONResponse:
         raise HTTPException(status_code=503, detail="Media source not ready")
     body = await request.json()
     src_type = body.get("type")
-    if src_type not in ("orbbec", "camera", "video"):
-        raise HTTPException(status_code=422, detail="type must be 'orbbec', 'camera' or 'video'")
-    if src_type == "video":
+    if src_type not in ("orbbec", "camera", "video", "bag"):
+        raise HTTPException(status_code=422,
+                            detail="type must be 'orbbec', 'camera', 'video' or 'bag'")
+    if src_type in ("video", "bag"):
         path = body.get("path")
         if not path:
-            raise HTTPException(status_code=422, detail="path required for video source")
+            raise HTTPException(status_code=422, detail="path required for video/bag source")
         full_path = _REPO_ROOT / path
         if not full_path.exists():
             raise HTTPException(status_code=404, detail=f"Video not found: {path}")
-        _media.switch_source("video", path=str(full_path))
+        _media.switch_source(src_type, path=str(full_path))
     elif src_type == "orbbec":
         _media.switch_source("orbbec")
     else:
@@ -471,6 +548,78 @@ async def _frame_generator(request: Request):
             yield boundary + buf.tobytes() + b"\r\n"
 
         await asyncio.sleep(0.067)  # ~15 FPS cap
+
+
+# ---------------------------------------------------------------------------
+# Depth debug stream (shown in the UI sidebar while play mode is on)
+# ---------------------------------------------------------------------------
+
+def _render_depth_view() -> Optional[np.ndarray]:
+    """Colorized view of the aligned depth the detector works on, or None.
+
+    With a captured surface: the detector's own debug rendering (band/contact/
+    artifact colors). Before capture: a plain distance colormap so the stream
+    is still useful for aiming the camera.
+    """
+    depth = _media.read_depth_aligned() if _media is not None else None
+    if depth is None:
+        return None
+    if _detector is not None and depth.shape == _detector.surface.shape:
+        return _detector.render_debug(depth)
+    d = depth.astype(np.float32)
+    norm = np.clip((d - 400.0) / (3000.0 - 400.0), 0.0, 1.0)
+    img = cv2.applyColorMap((255 - norm * 255).astype(np.uint8),
+                            cv2.COLORMAP_TURBO)
+    img[depth == 0] = (25, 25, 25)
+    return img
+
+
+def _render_semantic_view() -> Optional[np.ndarray]:
+    """Semantic scene: tiles as colored regions, the foot (hover) orange, the
+    contact patch red with its centre marked, sounding tiles lit."""
+    tiles = _tile_cache.get("tiles", [])
+    w = int(_tile_cache.get("frame_width", 640))
+    h = int(_tile_cache.get("frame_height", 480))
+    hover = contact = None
+    held: set = set()
+    if _detector is not None and _media is not None:
+        depth = _media.read_depth_aligned()
+        if depth is not None and depth.shape == _detector.surface.shape:
+            _band, contact, hover = _detector.live_masks(depth)
+            held = set(_detector.held)
+    return render_semantic(tiles, w, h, hover=hover, contact=contact, held=held)
+
+
+@app.get("/depth_feed")
+async def depth_feed(request: Request) -> StreamingResponse:
+    return StreamingResponse(
+        _view_generator(request, _render_depth_view),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/semantic_feed")
+async def semantic_feed(request: Request) -> StreamingResponse:
+    return StreamingResponse(
+        _view_generator(request, _render_semantic_view),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+async def _view_generator(request: Request, render_fn):
+    boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+    loop = asyncio.get_event_loop()
+    while True:
+        if await request.is_disconnected():
+            break
+        img = await loop.run_in_executor(None, render_fn)
+        if img is None:
+            await asyncio.sleep(0.2)
+            continue
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            yield boundary + buf.tobytes() + b"\r\n"
+        await asyncio.sleep(0.1)  # ~10 FPS is plenty for a debug view
 
 
 # ---------------------------------------------------------------------------

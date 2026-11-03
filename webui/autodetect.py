@@ -60,14 +60,112 @@ def tiles_from_corners(
     canvas = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     to_image = cv2.getPerspectiveTransform(canvas, corners)  # canvas -> image
 
+    keys = build_keyboard(num_white, w, h)
+    blacks = [k for k in keys if k.kind == "black"]
+
     tiles: list[dict[str, Any]] = []
-    for key in build_keyboard(num_white, w, h)[:max_tiles]:
-        rect = np.float32([[[key.x0, key.y0], [key.x1, key.y0],
-                            [key.x1, key.y1], [key.x0, key.y1]]])
-        pts = cv2.perspectiveTransform(rect, to_image)[0]
+    for key in keys[:max_tiles]:
+        canvas_poly = _key_canvas_polygon(key, blacks)
+        pts = cv2.perspectiveTransform(
+            np.float32([canvas_poly]), to_image)[0]
         polygon = [[int(round(px)), int(round(py))] for px, py in pts]
         tiles.append({"polygon": polygon, "label": key.name, "note": key.name})
     return tiles
+
+
+def _key_canvas_polygon(key, blacks) -> "list[list[float]]":
+    """The key's polygon on the flat canvas — real piano-key shapes.
+
+    Black keys stay rectangles. White keys get the classic NOTCHED shape (the
+    upper part narrowed where a black key sits), so white and black tiles no
+    longer overlap: a press on F#4 lands ONLY on F#4, not visually/logically
+    on the whites beneath it as well.
+    """
+    if key.kind == "black":
+        return [[key.x0, key.y0], [key.x1, key.y0],
+                [key.x1, key.y1], [key.x0, key.y1]]
+    left = next((b for b in blacks if b.x0 < key.x0 < b.x1), None)
+    right = next((b for b in blacks if b.x0 < key.x1 < b.x1), None)
+    tl = float(left.x1) if left else float(key.x0)
+    tr = float(right.x0) if right else float(key.x1)
+    bh = float(blacks[0].y1) if blacks else float(key.y0)
+    x0, x1 = float(key.x0), float(key.x1)
+    y0, y1 = float(key.y0), float(key.y1)
+    if left and right:
+        return [[tl, y0], [tr, y0], [tr, bh], [x1, bh],
+                [x1, y1], [x0, y1], [x0, bh], [tl, bh]]
+    if right:
+        return [[x0, y0], [tr, y0], [tr, bh], [x1, bh], [x1, y1], [x0, y1]]
+    if left:
+        return [[tl, y0], [x1, y0], [x1, y1], [x0, y1], [x0, bh], [tl, bh]]
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
+def order_corners(corners, frame_bgr: "np.ndarray | None" = None,
+                  num_white: "int | None" = None) -> "tuple[np.ndarray, str]":
+    """4 mat corners in ANY click order -> TL,TR,BR,BL, oriented to the mat.
+
+    The UI lets the user click/drag the 4 corners in any order; a naive
+    sum/diff sort mislabels oblique quads (one point can 'win' two roles, which
+    collapses the perspective transform and with it all 24 keys). This instead:
+
+    1. validates the quad (4 distinct points, non-degenerate area, convex),
+    2. sorts the points cyclically and puts the LONG side horizontal
+       (the keyboard runs along the mat's long axis),
+    3. when a camera frame is given, resolves the 4 flip hypotheses against the
+       printed black-key pattern (mat_calibration.orient_corners) so C4 really
+       is C4; without a frame — or when the mat shows no pattern, e.g. lying
+       KEYS-DOWN with its blank back up — it falls back to a screen-geometric
+       orientation (the user then fixes C4 side / key edge with the flip
+       buttons, folded in server-side via flip_corners()).
+
+    Raises ValueError for degenerate input. Returns (float32 (4, 2), how),
+    where how is "pattern" (black keys decided) or "geometry" (fallback).
+    """
+    num_white = constants.DEFAULT_NUM_WHITE if num_white is None else num_white
+    pts = np.asarray(corners, dtype=np.float32)
+    if pts.shape != (4, 2) or not np.isfinite(pts).all():
+        raise ValueError("corners must be 4 finite (x, y) points")
+    for i in range(4):
+        for j in range(i + 1, 4):
+            if np.linalg.norm(pts[i] - pts[j]) < 2.0:
+                raise ValueError("two corners coincide — drag them apart")
+
+    ordered = mat_calibration.order_long_axis(pts)  # cyclic sort + long side horizontal
+    quad_i32 = ordered.round().astype(np.int32)
+    if cv2.contourArea(ordered) < 64.0 or not cv2.isContourConvex(quad_i32):
+        raise ValueError("corners form a degenerate (crossed or collapsed) quad")
+
+    if frame_bgr is not None:
+        oriented, iou = mat_calibration.orient_corners(
+            frame_bgr, ordered, num_white)
+        if iou >= 0.05:  # only trust the pattern when it actually saw black keys
+            return oriented, "pattern"
+
+    # Geometric fallback: top edge = the long side that is higher on screen,
+    # left = smaller x. Matches what a user looking at the image expects.
+    tl, tr, br, bl = ordered
+    if tl[1] + tr[1] > bl[1] + br[1]:
+        tl, tr, br, bl = bl, br, tr, tl      # vertical mirror
+    if tl[0] > tr[0]:
+        tl, tr, br, bl = tr, tl, bl, br      # horizontal mirror
+    return np.float32([tl, tr, br, bl]), "geometry"
+
+
+def flip_corners(ordered, flip_h: bool = False, flip_v: bool = False) -> np.ndarray:
+    """User-requested orientation override on TL,TR,BR,BL corners.
+
+    Needed when the mat lies keys-down (blank back up): no printed pattern is
+    visible, so which end is C4 (``flip_h``) and along which long edge the
+    black keys run (``flip_v``) cannot be detected — the user says so instead.
+    Also lets the user overrule a wrong pattern detection.
+    """
+    tl, tr, br, bl = np.asarray(ordered, dtype=np.float32)
+    if flip_h:
+        tl, tr, br, bl = tr, tl, bl, br      # swap the C4 side
+    if flip_v:
+        tl, tr, br, bl = bl, br, tr, tl      # black keys along the other edge
+    return np.float32([tl, tr, br, bl])
 
 
 def detect_corners(frame_bgr: np.ndarray, num_white: "int | None" = None):
@@ -91,6 +189,13 @@ def detect_corners(frame_bgr: np.ndarray, num_white: "int | None" = None):
     if corners is None:
         return None
     corners = np.asarray(corners, dtype=np.float32) + [x_off, y_off]  # -> full-frame coords
+    # The refined quad may extrapolate slightly beyond the frame (a mat edge
+    # cut off at the border). Clamp into the visible frame — including the
+    # letterbox bars — so every corner handle is visible and draggable in the
+    # UI; the user fine-tunes from there.
+    h, w = frame_bgr.shape[:2]
+    corners[:, 0] = np.clip(corners[:, 0], 0, w - 1)
+    corners[:, 1] = np.clip(corners[:, 1], 0, h - 1)
     return corners.tolist()
 
 

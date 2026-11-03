@@ -33,6 +33,10 @@ Pi's hotspot), then:
 
 1. **Mat-Ecken setzen** — click the mat's 4 corners → 24 keys appear (drag the
    corner handles to fine-tune; the keys follow, perspective-correct).
+   The mat may also lie **keys-down** (blank back up — e.g. to avoid IR glare
+   from the glossy print): with no visible pattern the layout can't be
+   auto-oriented, so use the *Ausrichtung* buttons (swap the C4 end / put the
+   black keys on the other long edge) to set it.
 2. **Oberfläche erfassen** — with no fingers/feet in view.
 3. **Play** — press the keys; the browser plays the notes.
 

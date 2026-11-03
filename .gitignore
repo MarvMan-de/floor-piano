@@ -48,3 +48,7 @@ markers/
 *.mkv
 Log/
 **/Log/
+
+# Orbbec .bag recordings (100+ MB — GitHub rejects them)
+*.bag
+video/

@@ -101,7 +101,7 @@
           <span id="status-msg"></span>
           <div class="spacer"></div>
           <button id="btn-save" class="primary">Speichern</button>
-          <button id="btn-discard">Verwerfen</button>
+          <button id="btn-discard" title="Alle Tasten und Ecken löschen (neue Session = neues Setup)">Verwerfen</button>
         </div>
 
         <!-- Video playback controls (hidden in camera mode) -->
@@ -125,10 +125,49 @@
         <div class="props-actions">
           <button id="btn-autodetect" title="Mattenecken automatisch vorschlagen">&#x26B2; Auto-Ecken</button>
           <button id="btn-add-draw" title="Eine Taste frei einzeichnen">+ Taste zeichnen</button>
+          <button id="btn-calib-feet"
+                  title="Mit beiden Füßen auf die Matte stellen und still stehen — misst die Schuhdicke und stellt die Berührungs-Toleranz exakt darauf ein (nach 'Oberfläche erfassen')">
+            &#128099; Füße kalibrieren</button>
+        </div>
+        <!-- Orientation override: needed when the mat lies keys-down (blank
+             back up) and the printed pattern can't decide the layout -->
+        <div id="orient-actions" style="display:none">
+          <h2>Ausrichtung</h2>
+          <button id="btn-flip-h" title="Tastenreihenfolge spiegeln (welches Ende ist C4?)">&#8596; C4-Seite tauschen</button>
+          <button id="btn-flip-v" title="Schwarze Tasten an der anderen Längskante">&#8597; Schwarze Tasten andere Kante</button>
+          <p class="hint" id="orient-hint" style="display:none">
+            Kein Tastenmuster erkennbar (Matte umgedreht?) — Ausrichtung mit
+            den Buttons festlegen.
+          </p>
         </div>
         <h2>Eigenschaften</h2>
         <div id="props-form">
           <p class="hint">Taste anklicken, um sie zu bearbeiten.</p>
+        </div>
+        <!-- Live depth + semantic views — only while play mode is on -->
+        <div id="depth-section" style="display:none">
+          <h2>Tiefenbild
+            <span class="info-tip" tabindex="0" aria-label="Farblegende">i
+              <span class="tip-body">
+                <span>Farbverlauf = Entfernung (wie OrbbecViewer)</span>
+                <span><span class="lg lg-red"></span> Kontakt (löst aus)</span>
+                <span><span class="lg lg-yellow"></span> im Kontaktband</span>
+                <span><span class="lg lg-cyan"></span> Umriss: Fuß/Hand darüber (stumm)</span>
+                <span>abgedunkelt = maskiert · schwarz = kein Messwert</span>
+              </span>
+            </span>
+          </h2>
+          <img id="depth-view" alt="Tiefenbild der Kamera" />
+          <h2>Semantik
+            <span class="info-tip" tabindex="0" aria-label="Farblegende">i
+              <span class="tip-body">
+                <span>Tasten in ihrer Farbe · hell = klingt gerade</span>
+                <span><span class="lg lg-orange"></span> Fuß/Bein (erkanntes Objekt)</span>
+                <span><span class="lg lg-red"></span> Kontaktfläche · weißer Punkt = Fußmitte</span>
+              </span>
+            </span>
+          </h2>
+          <img id="semantic-view" alt="Semantische Ansicht: Tasten und Fuß" />
         </div>
       </aside>
 

@@ -44,6 +44,8 @@ const state = {
   suggestions: [],
   dragState: null,
   cornerPoints: [],     // 4 mat corners (frame coords) for the corner tool
+  flipH: false,         // orientation override: swap the C4 end
+  flipV: false,         // orientation override: black keys on the other edge
   frameSize: { w: 640, h: 480 },
   _nextId: 1,
 
@@ -100,6 +102,13 @@ const btnPlaceCorners = document.getElementById("btn-place-corners");
 const btnPlay        = document.getElementById("btn-play");
 const btnCaptureSurface = document.getElementById("btn-capture-surface");
 const suggActions   = document.getElementById("suggestion-actions");
+const depthSection  = document.getElementById("depth-section");
+const depthView     = document.getElementById("depth-view");
+const semanticView  = document.getElementById("semantic-view");
+const orientActions = document.getElementById("orient-actions");
+const orientHint    = document.getElementById("orient-hint");
+const btnFlipH      = document.getElementById("btn-flip-h");
+const btnFlipV      = document.getElementById("btn-flip-v");
 const btnAcceptAll  = document.getElementById("btn-accept-all");
 const btnRejectAll  = document.getElementById("btn-reject-all");
 
@@ -134,7 +143,9 @@ async function init() {
 async function fetchConfig() {
   const res = await fetch("/api/config");
   const doc = await res.json();
-  const size = { w: doc.frame_width || 640, h: doc.frame_height || 480 };
+  // keep camera_index so saving the config doesn't silently reset it to 0
+  const size = { w: doc.frame_width || 640, h: doc.frame_height || 480,
+                 camera_index: doc.camera_index || 0 };
   state.frameSize = size;
   overlayEl.setAttribute("viewBox", `0 0 ${size.w} ${size.h}`);
   state.tiles = (doc.tiles || []).map(t => ({ ...t, id: t.id ?? state._nextId++ }));
@@ -251,9 +262,14 @@ async function initSources() {
     const res = await fetch("/api/sources");
     const data = await res.json();
     const videos = data.videos || [];
-    videoFileSelect.innerHTML = videos.length
-      ? videos.map(v => `<option value="${esc(v)}">${esc(basename(v))}</option>`).join("")
-      : `<option value="">— no videos found —</option>`;
+    const bags = data.bags || [];
+    const opts = [
+      ...videos.map(v => `<option value="${esc(v)}" data-kind="video">${esc(basename(v))}</option>`),
+      ...bags.map(b => `<option value="${esc(b)}" data-kind="bag">${esc(basename(b))} (Tiefe)</option>`),
+    ];
+    videoFileSelect.innerHTML = opts.length
+      ? opts.join("")
+      : `<option value="">— keine Videos gefunden —</option>`;
   } catch (_) {
     videoFileSelect.innerHTML = `<option value="">— error loading sources —</option>`;
   }
@@ -264,8 +280,13 @@ function basename(path) {
 }
 
 // ── Source switching ──────────────────────────────────────────────────────
+function selectedFileKind() {
+  const opt = videoFileSelect.selectedOptions && videoFileSelect.selectedOptions[0];
+  return (opt && opt.dataset.kind) || "video";
+}
+
 async function switchSource(type, path) {
-  const body = type === "video" ? { type, path } : { type };
+  const body = (type === "video" || type === "bag") ? { type, path } : { type };
   try {
     const res = await fetch("/api/source", {
       method: "POST",
@@ -278,7 +299,9 @@ async function switchSource(type, path) {
     // Go back to LIVE to restart the stream
     setMode("LIVE");
     startVideoPolling(type === "video");
-    setStatus(type === "video" ? `Video: ${basename(path)}` : "Live camera");
+    setStatus(type === "video" ? `Video: ${basename(path)}`
+              : type === "bag" ? `Aufnahme: ${basename(path)} — Tasten markieren, dann wie live spielen`
+              : "Live camera");
     setTimeout(() => setStatus(""), 3000);
   } catch (err) {
     setStatus("Source error: " + err.message, "err");
@@ -405,6 +428,19 @@ async function captureSurface() {
   }
 }
 
+async function calibrateFeet() {
+  setStatus("Mit beiden Füßen auf die Matte stellen und still stehen…");
+  try {
+    const res = await fetch("/api/capture_feet", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Kalibrierung fehlgeschlagen");
+    setStatus(`Berührungs-Toleranz kalibriert: Schuhoberseite bis `
+              + `${data.touch_ceiling_mm} mm über der Matte zählt als Druck`, "ok");
+  } catch (err) {
+    setStatus("Fußkalibrierung: " + err.message, "err");
+  }
+}
+
 async function togglePlayMode() {
   const on = !state.playMode;
   try {
@@ -418,6 +454,11 @@ async function togglePlayMode() {
     updateSteps();
     clearInterval(state._playInterval);
     state._playInterval = null;
+    // Depth debug view in the sidebar: stream only while play mode is on
+    // (clearing src closes the MJPEG connection).
+    if (depthSection) depthSection.style.display = on ? "block" : "none";
+    if (depthView) depthView.src = on ? `/depth_feed?t=${Date.now()}` : "";
+    if (semanticView) semanticView.src = on ? `/semantic_feed?t=${Date.now()}` : "";
     if (on) {
       setMode("LIVE");   // live feed with the tiles overlaid; presses flash + sound
       state._playInterval = setInterval(pollTriggers, 120);
@@ -523,11 +564,20 @@ function updateSteps() {
 
 function renderCorners() {
   cornersLayer.innerHTML = "";
+  // Orientation override panel: only useful once a full quad exists
+  if (orientActions) {
+    orientActions.style.display =
+      (state.mode === "CORNERS" && state.cornerPoints.length === 4) ? "flex" : "none";
+  }
   if (state.mode !== "CORNERS") return;
   const pts = state.cornerPoints;
   if (pts.length >= 2) {
+    // Outline in cyclic order so it never draws crossed, whatever the click
+    // order was. The numbered handles keep their click indices (drag state
+    // refers to them), so only the outline is re-sorted.
+    const outlinePts = pts.length >= 4 ? cyclicCorners(pts) : pts;
     const outline = svgEl(pts.length >= 4 ? "polygon" : "polyline", {
-      points: pts.map(p => p.join(",")).join(" "),
+      points: outlinePts.map(p => p.join(",")).join(" "),
       fill: "none", stroke: "#00e5ff", "stroke-width": "2",
       "stroke-dasharray": "6 4", "pointer-events": "none",
     });
@@ -744,7 +794,7 @@ function selectTile(id) {
 function onOverlayClick(e) {
   if (state.mode === "CORNERS") {
     if (state.cornerPoints.length < 4) {
-      state.cornerPoints.push(svgPoint(e));
+      state.cornerPoints.push(clampToFrame(svgPoint(e)));
       renderCorners();
       if (state.cornerPoints.length === 4) generateTilesFromCorners();
       else setStatus(`Ecke ${state.cornerPoints.length + 1}/4 der Matte klicken`);
@@ -858,7 +908,7 @@ function onDragMove(e) {
   const dx = pt[0] - ds.startPt[0];
   const dy = pt[1] - ds.startPt[1];
   if (ds.kind === "corner") {
-    state.cornerPoints[ds.cornerIdx] = [ds.orig[0] + dx, ds.orig[1] + dy];
+    state.cornerPoints[ds.cornerIdx] = clampToFrame([ds.orig[0] + dx, ds.orig[1] + dy]);
     renderCorners();
     if (state.cornerPoints.length === 4) scheduleGenerate();  // live-ish snap
     return;
@@ -970,6 +1020,8 @@ function enterCornersMode() {
   if (state.mode === "LIVE") setMode("FREEZE");
   state.cornerPoints = [];
   state.suggestions = [];
+  state.flipH = state.flipV = false;   // fresh corners = fresh orientation
+  if (orientHint) orientHint.style.display = "none";
   setMode("CORNERS");
 }
 
@@ -987,6 +1039,7 @@ async function runAutoCorners() {
       return;
     }
     state.cornerPoints = data.corners.map(p => [Math.round(p[0]), Math.round(p[1])]);
+    state.flipH = state.flipV = false;   // pattern decided; flips start neutral
     setMode("CORNERS");
     generateTilesFromCorners();
     setStatus("Ecken vorgeschlagen — auf die echten Mattenecken ziehen, dann Save");
@@ -995,35 +1048,39 @@ async function runAutoCorners() {
   }
 }
 
-// Sort 4 points into TL,TR,BR,BL so placement order doesn't matter.
-function orderCorners(pts) {
-  const sum = p => p[0] + p[1];
-  const diff = p => p[0] - p[1];
-  return [
-    pts.reduce((a, b) => (sum(b) < sum(a) ? b : a)),   // TL: smallest x+y
-    pts.reduce((a, b) => (diff(b) > diff(a) ? b : a)),  // TR: largest x-y
-    pts.reduce((a, b) => (sum(b) > sum(a) ? b : a)),    // BR: largest x+y
-    pts.reduce((a, b) => (diff(b) < diff(a) ? b : a)),  // BL: smallest x-y
-  ];
+// Cyclic (non-crossing) order of up to 4 points — ONLY for drawing the dashed
+// outline. The semantic TL,TR,BR,BL ordering + orientation happens server-side
+// in /api/generate_tiles against the live black-key pattern: the old client
+// sum/diff sort mislabeled oblique quads (one point could win two roles, which
+// collapsed the perspective transform and with it all 24 keys).
+function cyclicCorners(pts) {
+  if (pts.length < 3) return pts;
+  const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length;
+  const cy = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+  return [...pts].sort((a, b) =>
+    Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
 }
 
 let _genTimer = null;
 function scheduleGenerate() {
   clearTimeout(_genTimer);
-  _genTimer = setTimeout(generateTilesFromCorners, 120);  // debounce during drag
+  // debounce during drag; skip the undo push so the stack doesn't flood
+  // with intermediate corner states every 120 ms
+  _genTimer = setTimeout(() => generateTilesFromCorners(false), 120);
 }
 
-async function generateTilesFromCorners() {
+async function generateTilesFromCorners(recordUndo = true) {
   if (state.cornerPoints.length !== 4) return;
   try {
     const res = await fetch("/api/generate_tiles", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ corners: orderCorners(state.cornerPoints) }),
+      body: JSON.stringify({ corners: state.cornerPoints,
+                            flip_h: state.flipH, flip_v: state.flipV }),
     });
     if (!res.ok) throw new Error((await res.json()).detail || "generate failed");
     const data = await res.json();
-    pushUndo();
+    if (recordUndo) pushUndo();
     state.tiles = (data.tiles || []).map((t, i) => ({
       id: state._nextId++,
       label: t.label, note: t.note, polygon: t.polygon,
@@ -1032,7 +1089,14 @@ async function generateTilesFromCorners() {
     state.dirty = true;
     state.suggestions = [];
     renderAll();
-    setStatus(`${state.tiles.length} Tasten projiziert — Ecken justieren, dann Save`);
+    // Keys-down mat (or any patternless view): the black keys can't decide the
+    // layout — surface the flip buttons' hint so the user sets it explicitly.
+    const blind = data.oriented_by === "geometry";
+    if (orientHint) orientHint.style.display = blind ? "block" : "none";
+    setStatus(blind
+      ? `${state.tiles.length} Tasten projiziert — Muster nicht erkennbar, `
+        + "Ausrichtung ggf. rechts umschalten"
+      : `${state.tiles.length} Tasten projiziert — Ecken justieren, dann Save`);
   } catch (err) {
     setStatus("Tasten-Erzeugung fehlgeschlagen: " + err.message, "err");
   }
@@ -1067,12 +1131,21 @@ async function saveConfig() {
 }
 
 async function discardChanges() {
-  if (state.dirty && !confirm("Discard unsaved changes?")) return;
-  await fetchConfig();
+  // "Verwerfen" clears the whole layout: every session has a different
+  // physical setup, so a stale saved layout is never what you want back.
+  if (state.tiles.length && !confirm("Alle Tasten löschen?")) return;
+  pushUndo();
+  state.tiles = [];
+  state.cornerPoints = [];
   state.suggestions = [];
+  state.selectedId = null;
+  state.flipH = state.flipV = false;
+  if (orientHint) orientHint.style.display = "none";
+  state.dirty = true;
   setMode("LIVE");
-  setStatus("Changes discarded");
-  setTimeout(() => setStatus(""), 2000);
+  renderAll();
+  setStatus("Alle Tasten gelöscht (Strg+Z macht es rückgängig)");
+  setTimeout(() => setStatus(""), 3000);
 }
 
 // ── Undo ──────────────────────────────────────────────────────────────────
@@ -1112,6 +1185,13 @@ function svgPoint(e) {
     Math.round((e.clientX - rect.left) * (w / rect.width)),
     Math.round((e.clientY - rect.top)  * (h / rect.height)),
   ];
+}
+
+// Keep a point inside the frame (incl. the black letterbox bars) so corner
+// handles can never be dragged out of reach.
+function clampToFrame(pt) {
+  const { w, h } = state.frameSize;
+  return [Math.min(Math.max(pt[0], 0), w - 1), Math.min(Math.max(pt[1], 0), h - 1)];
 }
 
 function centroid(polygon) {
@@ -1179,6 +1259,19 @@ function bindEvents() {
   if (btnPlay) btnPlay.addEventListener("click", togglePlayMode);
   if (btnCaptureSurface) btnCaptureSurface.addEventListener("click", captureSurface);
   btnAutodetect.addEventListener("click", runAutoCorners);
+  const btnCalibFeet = document.getElementById("btn-calib-feet");
+  if (btnCalibFeet) btnCalibFeet.addEventListener("click", calibrateFeet);
+  // Orientation override (mat lying keys-down, or wrong auto-orientation)
+  if (btnFlipH) btnFlipH.addEventListener("click", () => {
+    state.flipH = !state.flipH;
+    btnFlipH.classList.toggle("active", state.flipH);
+    generateTilesFromCorners(false);
+  });
+  if (btnFlipV) btnFlipV.addEventListener("click", () => {
+    state.flipV = !state.flipV;
+    btnFlipV.classList.toggle("active", state.flipV);
+    generateTilesFromCorners(false);
+  });
   btnAcceptAll.addEventListener("click", acceptAllSuggestions);
   btnRejectAll.addEventListener("click", clearSuggestions);
 
@@ -1191,14 +1284,14 @@ function bindEvents() {
         await switchSource("camera");
       } else {
         const path = videoFileSelect.value;
-        if (path) await switchSource("video", path);
+        if (path) await switchSource(selectedFileKind(), path);
       }
     });
   });
 
   videoFileSelect.addEventListener("change", async () => {
     const path = videoFileSelect.value;
-    if (path) await switchSource("video", path);
+    if (path) await switchSource(selectedFileKind(), path);
   });
 
   // Video controls
