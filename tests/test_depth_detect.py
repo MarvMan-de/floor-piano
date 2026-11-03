@@ -584,3 +584,38 @@ def test_noise_excursions_do_not_mask_pixels_but_systematic_inband_does():
     det.calibrate_artifacts(frames)
     assert det.artifact[80, 80]                 # systematic -> masked
     assert det.artifact[200:400, 100:500].mean() < 0.02   # noise only -> alive
+
+
+def test_neighbour_lockout_blocks_same_foot_but_not_far_or_later_presses():
+    surface = _flat()
+    tiles = [_tile(1, 50, 50, 150, 150), _tile(2, 160, 50, 260, 150),
+             _tile(3, 500, 50, 600, 150)]
+    det = _detector(tiles, surface)
+    det.update(surface)
+    first = _press(surface, 70, 70, 130, 130)
+    fired = set()
+    for _ in range(4):
+        fired |= det.update(first)
+    assert fired == {1}
+    # 1-2 frames later the same foot's edge shows up on the next key: ignored
+    near = _press(first, 158, 70, 198, 130)
+    fired = set()
+    for _ in range(4):
+        fired |= det.update(near)
+    assert 2 not in fired
+    # a press far away is a different foot: fires immediately
+    far = _press(near, 510, 70, 590, 130)
+    fired = set()
+    for _ in range(4):
+        fired |= det.update(far)
+    assert 3 in fired
+    # once the lockout has expired, the neighbour may fire on its own
+    for _ in range(12):
+        det.update(far)
+    det.update(first)   # foot leaves the neighbour
+    for _ in range(6):
+        det.update(surface)
+    fired = set()
+    for _ in range(5):
+        fired |= det.update(_press(surface, 158, 70, 198, 130))
+    assert fired == {2}

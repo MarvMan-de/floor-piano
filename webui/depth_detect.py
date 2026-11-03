@@ -105,6 +105,14 @@ PRESENCE_RADIUS_PX = 45        # band pixels only count as "foot still there"
                                # wrinkle left behind by a press has no foot
                                # above it and must not keep a key held forever
 
+# --- same-foot lockout --------------------------------------------------------
+NEIGHBOUR_LOCKOUT_FRAMES = 8   # after a press, a new blob whose centre is this
+NEIGHBOUR_RADIUS_PX = 40       # close to the pressed key is the SAME foot rolling /
+                               # spreading, not a new press (the contact-overlap
+                               # guard alone is too weak once the pressed key's
+                               # own contact patch is small). Trade-off: the
+                               # other foot on the next key within ~0.3 s waits.
+
 # --- temporal per-tile logic --------------------------------------------------
 DEFAULT_CONFIRM_FRAMES = 2     # consecutive detections before a tile fires
 DEFAULT_RELEASE_FRAMES = 3     # consecutive misses before a held tile releases
@@ -494,6 +502,7 @@ class PressDetector:
         lab = label_map[label_map >= 0]
         self._tile_area = np.bincount(lab, minlength=len(self.tile_ids)) \
             if lab.size else np.zeros(len(self.tile_ids), np.int64)
+        self._near_cache = {}
         self._reset_runtime()
         if self._calibrated and self.plane_fallback:
             mat = self._mat_mask_from_labels()
@@ -510,6 +519,9 @@ class PressDetector:
         self._miss = {}
         self._quiet = {}
         self.held = set()
+        self._frame_no = 0
+        self._fired_at = {}          # tile id -> frame number it fired on
+        self._near_cache = {}        # tile index -> dilated tile mask
 
     # -- per-frame ------------------------------------------------------------
 
@@ -525,6 +537,7 @@ class PressDetector:
             return set()
         d = depth_mm.astype(np.int32)
         m = self._maps     # one consistent snapshot for the whole frame
+        self._frame_no += 1
 
         # Motion gate: remember which pixels changed recently (vs their own
         # noise level). On a static scene nothing has motion -> nothing presses.
@@ -654,6 +667,21 @@ class PressDetector:
                 if ids.size:
                     holding_objs.update(np.unique(ids).tolist())
 
+        # Same-foot lockout: tiles pressed a moment ago make their surroundings
+        # off-limits for NEW presses (the foot is still rolling over them).
+        lock = None
+        for k, tid_ in enumerate(self.tile_ids):
+            if (tid_ in self.held and self._frame_no - self._fired_at.get(
+                    tid_, -10**9) <= NEIGHBOUR_LOCKOUT_FRAMES):
+                near = self._near_cache.get(k)
+                if near is None:
+                    r = 2 * NEIGHBOUR_RADIUS_PX + 1
+                    near = cv2.dilate((self.label_map == k).astype(np.uint8),
+                                      cv2.getStructuringElement(
+                                          cv2.MORPH_ELLIPSE, (r, r))) > 0
+                    self._near_cache[k] = near
+                lock = near if lock is None else (lock | near)
+
         best_by_obj: dict = {}   # foot object -> (area, tile): ONE note per foot
         hits = set()
         for b in range(1, n):
@@ -685,6 +713,9 @@ class PressDetector:
             # The tile under the blob's CENTRE — the middle of the foot decides,
             # not whichever tile the rim happens to graze.
             cx, cy = centroids[b]
+            if lock is not None and lock[min(h - 1, max(0, int(round(cy)))),
+                                         min(w - 1, max(0, int(round(cx))))]:
+                continue
             tid = self.label_map[min(h - 1, max(0, int(round(cy)))),
                                  min(w - 1, max(0, int(round(cx))))]
             if tid < 0:  # centre off the keys (e.g. curved blob) -> majority vote
@@ -805,6 +836,7 @@ class PressDetector:
                         and self._streak[tid] >= self.confirm_frames):
                     fired.add(tid)
                     self.held.add(tid)
+                    self._fired_at[tid] = self._frame_no
             else:
                 self._streak[tid] = 0
                 if tid in self.held:
