@@ -84,7 +84,15 @@ class MediaSource:
         # D2C alignment: when detect_enabled, also grab depth aligned to colour
         # and letterbox it identically, so depth[y,x] matches the colour tiles.
         self._align: Any = None
+        # Sensor-recommended post-processing filters (noise removal, spatial/
+        # temporal smoothing …) — the same chain OrbbecViewer applies, which is
+        # why its depth looks much cleaner than raw frames.
+        self._depth_filters: list = []
+        self._empty_reads: int = 0   # consecutive empty reads (bag end detection)
         self._depth: Optional[np.ndarray] = None   # latest aligned depth (uint16 mm, WxH)
+        # every aligned depth frame since the last drain — the detector must
+        # see the stream GAPLESSLY (a toe's first contact is a single frame)
+        self._depth_q: list = []
         self.detect_enabled: bool = False
 
         # Frame dimensions
@@ -146,6 +154,7 @@ class MediaSource:
             self._ob = None
         self._align = None
         self._depth = None
+        self._depth_filters = []
 
     def read_frame(self) -> Optional[np.ndarray]:
         """Return a copy of the latest BGR frame, or None if not yet available."""
@@ -201,8 +210,13 @@ class MediaSource:
     def _open_video(self, path: str) -> cv2.VideoCapture:
         return cv2.VideoCapture(path)
 
-    def _open_orbbec(self):
-        """Start a pyorbbecsdk COLOUR (+DEPTH, D2C-aligned) pipeline, or None."""
+    def _open_orbbec(self, bag_path: Optional[str] = None):
+        """Start a pyorbbecsdk COLOUR (+DEPTH, D2C-aligned) pipeline, or None.
+
+        With ``bag_path`` the frames come from a recorded .bag file instead of
+        the live camera (PlaybackDevice) — same streams, same alignment, so
+        the whole tile/press pipeline works on recordings unchanged.
+        """
         self._align = None
         try:
             from pyorbbecsdk import (Pipeline, Config, OBSensorType, OBFormat,
@@ -211,7 +225,21 @@ class MediaSource:
             print(f"[camera_source] pyorbbecsdk not available ({e}) — no Orbbec camera")
             return None
         try:
-            pipe = Pipeline()
+            if bag_path:
+                from pyorbbecsdk import PlaybackDevice
+                pipe = Pipeline(PlaybackDevice(bag_path))
+            else:
+                # Pipeline() with NO device attached does not raise cleanly —
+                # on Windows the SDK dies with a heap-corruption crash
+                # (0xC0000374) that takes the whole server process with it
+                # before uvicorn ever binds its port ("connection refused").
+                # Enumerating first is crash-safe, so bail out here instead.
+                from pyorbbecsdk import Context
+                if Context().query_devices().get_count() == 0:
+                    print("[camera_source] no Orbbec device attached — "
+                          "falling back (webcam / video / bag)")
+                    return None
+                pipe = Pipeline()
             cfg = Config()
             plist = pipe.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
             prof = None
@@ -238,12 +266,66 @@ class MediaSource:
             except Exception as e:
                 print(f"[camera_source] depth stream unavailable ({e}) — colour only")
             pipe.start(cfg)
+            self._depth_filters = self._load_depth_filters(pipe)
             print("[camera_source] Orbbec started (Gemini RGB%s)"
                   % (" + aligned depth" if self._align else ""))
             return pipe
         except Exception as e:
             print(f"[camera_source] Orbbec start failed ({e})")
             return None
+
+    @staticmethod
+    def _load_depth_filters(pipe) -> list:
+        """The depth sensor's recommended post-processing chain, with the
+        quality filters switched ON (the clean OrbbecViewer look): noise
+        removal (speckles / flying pixels at foot edges), edge-preserving
+        spatial smoothing and temporal smoothing (depth wobble). Decimation is
+        excluded: it would change the frame size and break the surface/tile
+        registration."""
+        # Speckle removal only. Spatial/temporal smoothing made the depth
+        # PRETTIER but smeared away the small first-contact patch of a toe
+        # landing on a narrow black key (verified against a recorded bag:
+        # raw depth detects the press, smoothed depth mis-assigns it) — the
+        # detector's own noise/stability gates do that job instead.
+        WANT_ON = ("NoiseRemoval", "EdgeNoiseRemoval")
+        try:
+            from pyorbbecsdk import OBSensorType
+            sensor = pipe.get_device().get_sensor(OBSensorType.DEPTH_SENSOR)
+            filters = []
+            for f in sensor.get_recommended_filters():
+                name = f.get_name()
+                if "Decimation" in name:
+                    continue
+                if "Temporal" in name or "SpatialAdvanced" in name:
+                    continue  # smoothing, see WANT_ON note
+                if any(w in name for w in WANT_ON) and not f.is_enabled():
+                    try:
+                        f.enable(True)
+                    except Exception:
+                        pass
+                if f.is_enabled():
+                    filters.append(f)
+            if filters:
+                print("[camera_source] depth filters: "
+                      + ", ".join(f.get_name() for f in filters))
+            return filters
+        except Exception as e:
+            print(f"[camera_source] no depth post-processing ({e})")
+            return []
+
+    def _filter_depth(self, depth_frame):
+        """Run the recommended post-processing chain on one depth frame."""
+        for f in self._depth_filters:
+            try:
+                out = f.process(depth_frame)
+                if out is None:
+                    continue
+                if not hasattr(out, "get_width") and hasattr(out, "as_video_frame"):
+                    out = out.as_video_frame()
+                depth_frame = out
+            except Exception:
+                pass  # a failing filter must never take down the stream
+        return depth_frame
 
     def _read_orbbec(self) -> None:
         """Grab one Gemini frame; store colour (letterboxed) and, when detection
@@ -256,7 +338,19 @@ class MediaSource:
         except Exception:
             frames = None
         if frames is None:
+            # A bag that stopped delivering frames has reached its end — loop
+            # it by reopening the playback pipeline (like the video source).
+            if self._source_type == "bag" and self._video_path:
+                self._empty_reads += 1
+                if self._empty_reads >= 15:  # ~1.5s without frames
+                    self._empty_reads = 0
+                    try:
+                        self._ob.stop()
+                    except Exception:
+                        pass
+                    self._ob = self._open_orbbec(bag_path=self._video_path)
             return
+        self._empty_reads = 0
 
         # Only pay for D2C alignment while a play/test mode needs depth.
         if self.detect_enabled and self._align is not None:
@@ -283,6 +377,7 @@ class MediaSource:
         """Letterbox the aligned depth into (width,height) mm and store it."""
         if depth_frame is None:
             return
+        depth_frame = self._filter_depth(depth_frame)
         w, h = depth_frame.get_width(), depth_frame.get_height()
         raw = np.frombuffer(depth_frame.get_data(), dtype=np.uint16)
         if raw.size != w * h:
@@ -294,6 +389,19 @@ class MediaSource:
         depth[depth >= 60000] = 0
         with self._lock:
             self._depth = depth
+            self._depth_q.append(depth)
+            if len(self._depth_q) > 8:
+                del self._depth_q[0]
+
+    def drain_depth_aligned(self) -> "list[np.ndarray]":
+        """All aligned depth frames since the last drain (oldest first).
+
+        For the press detector: unlike read_depth_aligned() this never skips a
+        frame, so single-frame events (the first touch of a landing toe)
+        reach the temporal gates exactly as in an offline replay."""
+        with self._lock:
+            frames, self._depth_q = self._depth_q, []
+        return frames
 
     def read_depth_aligned(self) -> Optional[np.ndarray]:
         """Latest D2C-aligned, letterboxed depth (uint16 mm) — same space as tiles."""
@@ -327,6 +435,20 @@ class MediaSource:
             with self._lock:
                 self._source_type = "orbbec" if self._ob is not None else "camera"
                 self._video_path = None
+                self._playing = True
+                self._fps = 30.0
+                self._total_frames = 0
+                self._current_frame_idx = 0
+            if self._ob is None:
+                self._cap = self._open_camera(self._camera_index)
+            return True
+
+        if pending["type"] == "bag":
+            path = pending["path"]
+            self._ob = self._open_orbbec(bag_path=path)
+            with self._lock:
+                self._source_type = "bag" if self._ob is not None else "camera"
+                self._video_path = path if self._ob is not None else None
                 self._playing = True
                 self._fps = 30.0
                 self._total_frames = 0
@@ -377,7 +499,7 @@ class MediaSource:
         source = self._source_type
         # Fire per-frame detection for video (brightness) and orbbec (depth). The
         # orbbec callback reads the aligned depth via read_depth_aligned().
-        if cb is not None and source in ("video", "orbbec"):
+        if cb is not None and source in ("video", "orbbec", "bag"):
             try:
                 cb(frame)
             except Exception:
@@ -398,7 +520,7 @@ class MediaSource:
                 speed = self._speed
                 fps = self._fps
 
-            if mode == "orbbec":
+            if mode in ("orbbec", "bag"):
                 self._read_orbbec()
                 continue
 
