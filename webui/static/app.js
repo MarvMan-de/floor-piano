@@ -423,7 +423,9 @@ async function captureSurface() {
     updateSteps();
     const rescued = data.plane && data.plane.ok && data.plane.rescued_frac > 0
       ? ` · ${Math.round(data.plane.rescued_frac * 100)}% per Ebene ergänzt` : "";
-    setStatus(`Oberfläche erfasst (${Math.round((data.valid_frac || 0) * 100)}% gültig${rescued}) `
+    const noFit = data.plane && !data.plane.ok ? " · Ebene: kein Fit" : "";
+    setStatus(`Oberfläche erfasst (${Math.round((data.valid_frac || 0) * 100)}% gültig, `
+              + `${Math.round((data.artifact_frac || 0) * 100)}% tot${rescued}${noFit}) `
               + "— jetzt Tasten drücken", "ok");
   } catch (err) {
     setStatus("Oberfläche erfassen fehlgeschlagen: " + err.message, "err");
