@@ -35,8 +35,17 @@ temporal gates:
   consecutive frames, a tile fires only after consecutive detections, and after
   release it needs quiet frames before it may fire again.
 
+* **Plane fallback** — where the measured reference is unusable (holes, flicker,
+  specular reflections on the mat) a plane fitted to the good mat pixels stands
+  in for it instead of masking the zone dead (``plane_fallback``, default on).
+  The plane is fitted in INVERSE depth (1/z is linear in image coordinates for
+  any camera tilt). Limitation: where the LIVE depth is 0 while the foot is
+  down, the pixel stays blind — the plane only repairs the reference.
+
 Pure numpy/cv2 and fully unit-testable with synthetic depth maps.
 """
+from typing import NamedTuple, Optional
+
 import cv2
 import numpy as np
 
@@ -51,6 +60,21 @@ MAX_BAND_CEIL_MM = 80          # never accept more than this above the surface �
 NOISE_FLOOR_GAIN = 3.0         # band floor = max(base, gain*noise + 5)
 NOISE_FLOOR_CAP_MM = 30        # band floor never exceeds this (else zone ~dead)
 NOISE_BROKEN_MM = 30           # std above this = hopeless pixel -> artifact
+
+# --- plane fallback (rescue of unusable reference pixels) -------------------
+PLANE_TOL_MM = 15              # measured ref within this of the plane = usable
+PLANE_CONTACT_MIN_MM = 20      # rescued px: stricter band floor (plane is rougher)
+PLANE_CONSIST_MM = 10          # empty frames read this far IN FRONT of the plane
+                               # = in-band garbage, never rescue it
+PLANE_RANSAC_TOL_MM = 10
+PLANE_RANSAC_ITERS = 150
+PLANE_SAMPLE_PX = 5000
+PLANE_MIN_FIT_PX = 2000
+PLANE_MIN_INLIER_RATIO = 0.6
+PLANE_MAX_RMS_MM = 6.0
+PLANE_FIT_NOISE_MM = 10        # only low-noise pixels take part in the fit
+PLANE_Z_RANGE_MM = (200, 10000)
+MAT_DILATE_PX = 15             # tiles dilated by this = the "mat" domain
 
 # --- motion gate -------------------------------------------------------------
 DEFAULT_MOTION_MM = 10         # base per-pixel change that counts as movement
@@ -83,6 +107,87 @@ PRESENCE_RADIUS_PX = 45        # band pixels only count as "foot still there"
 DEFAULT_CONFIRM_FRAMES = 2     # consecutive detections before a tile fires
 DEFAULT_RELEASE_FRAMES = 3     # consecutive misses before a held tile releases
 DEFAULT_REARM_FRAMES = 3       # quiet frames after release before it may re-fire
+
+
+class _Maps(NamedTuple):
+    """Immutable bundle of the per-pixel maps — swapped in ONE assignment so the
+    capture thread never sees a half-rebuilt set."""
+    surface: np.ndarray
+    artifact: np.ndarray
+    min_map: np.ndarray
+    max_map: np.ndarray
+    motion_map: np.ndarray
+    rescued: Optional[np.ndarray]
+    hole_rescued: Optional[np.ndarray]
+
+
+def fit_inverse_depth_plane(depth, mask, rng=None):
+    """RANSAC plane through ``depth`` (mm) at the True pixels of ``mask``.
+
+    For a pinhole camera a 3D plane gives 1/z = a*u + b*v + c exactly (any
+    tilt), so the fit is done on w = 1000/z with u, v normalised to 0..1.
+    Inliers are judged in mm. Returns {"coef", "inlier_ratio", "rms_mm",
+    "n_fit"} or None when there is no convincing plane.
+    """
+    h, w_img = depth.shape
+    ys, xs = np.nonzero(mask)
+    z = depth[ys, xs].astype(np.float64)
+    ok = (z >= PLANE_Z_RANGE_MM[0]) & (z <= PLANE_Z_RANGE_MM[1])
+    ys, xs, z = ys[ok], xs[ok], z[ok]
+    n = z.size
+    if n < PLANE_MIN_FIT_PX:
+        return None
+    rng = rng if rng is not None else np.random.default_rng(0)
+    A = np.stack([xs / w_img, ys / h, np.ones(n)], axis=1)
+    wv = 1000.0 / z
+    sub = rng.choice(n, min(n, PLANE_SAMPLE_PX), replace=False)
+    As, zs = A[sub], z[sub]
+    idx = rng.integers(0, sub.size, (PLANE_RANSAC_ITERS, 3))
+    M = As[idx]
+    good = np.abs(np.linalg.det(M)) > 1e-9
+    if not good.any():
+        return None
+    coefs = np.linalg.solve(M[good], wv[sub][idx][good][..., None])[..., 0]
+    pw = coefs @ As.T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zhat = np.where(pw > 0, 1000.0 / pw, np.inf)
+    counts = (np.abs(zs[None, :] - zhat) < PLANE_RANSAC_TOL_MM).sum(axis=1)
+    coef = coefs[int(np.argmax(counts))]
+
+    def _inliers(c):
+        pw_ = A @ c
+        with np.errstate(divide="ignore", invalid="ignore"):
+            zh = np.where(pw_ > 0, 1000.0 / pw_, np.inf)
+        return np.abs(z - zh) < PLANE_RANSAC_TOL_MM
+
+    inl = _inliers(coef)
+    if inl.sum() < 3:
+        return None
+    sq = z[inl]                      # weights z^2: dz ~ z^2 * dw / 1000
+    coef, *_ = np.linalg.lstsq(A[inl] * sq[:, None], wv[inl] * sq, rcond=None)
+    inl = _inliers(coef)
+    if inl.sum() < 3:
+        return None
+    pw = A[inl] @ coef
+    if (pw <= 0).any():
+        return None
+    rms = float(np.sqrt(np.mean((z[inl] - 1000.0 / pw) ** 2)))
+    ratio = float(inl.sum()) / n
+    if ratio < PLANE_MIN_INLIER_RATIO or rms > PLANE_MAX_RMS_MM:
+        return None
+    return {"coef": tuple(float(c) for c in coef), "inlier_ratio": ratio,
+            "rms_mm": rms, "n_fit": int(inl.sum())}
+
+
+def plane_depth_map(coef, shape):
+    """Depth (int32 mm) of the fitted plane at every pixel; 0 where invalid."""
+    h, w = shape
+    a, b, c = coef
+    wv = (a * (np.arange(w) / w)[None, :] + b * (np.arange(h) / h)[:, None] + c)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = np.where(wv > 1e-6, 1000.0 / wv, 0.0)
+    z[(z < PLANE_Z_RANGE_MM[0]) | (z > PLANE_Z_RANGE_MM[1])] = 0.0
+    return np.round(z).astype(np.int32)
 
 
 def build_tile_label_map(tiles, width, height):
@@ -126,8 +231,9 @@ class PressDetector:
                  confirm_frames=DEFAULT_CONFIRM_FRAMES,
                  release_frames=DEFAULT_RELEASE_FRAMES,
                  rearm_frames=DEFAULT_REARM_FRAMES,
-                 require_attached=True):
-        self.surface = surface_mm.astype(np.int32)
+                 require_attached=True,
+                 plane_fallback=True):
+        self._measured = surface_mm.astype(np.int32)
         self.contact_min = int(contact_min_mm)
         self.contact_max = int(contact_max_mm)
         self.motion_mm = int(motion_mm)
@@ -139,15 +245,31 @@ class PressDetector:
         self.release_frames = max(1, int(release_frames))
         self.rearm_frames = max(0, int(rearm_frames))
         self.require_attached = bool(require_attached)
+        self.plane_fallback = bool(plane_fallback)
 
-        self.artifact = self.surface <= 0
+        self._raw_artifact = self._measured <= 0
         self.noise = None            # per-pixel std of the empty scene (mm)
+        self._rescued = None         # plane stands in for the reference here
+        self._hole_rescued = None    # ... and the empty scene had 0-readings
+        self._plane_z = None
+        self._mat_mask = None
+        self._empty_closest = None   # per-pixel nearest valid reading (empty)
+        self._valid_all = None
+        self._calibrated = False
+        self.plane_info = {"enabled": self.plane_fallback, "ok": False}
         self._build_maps()
         self.label_map = None
         self.tile_ids = []
         self._reset_runtime()
 
     # -- adaptive maps ---------------------------------------------------------
+
+    surface = property(lambda self: self._maps.surface)
+    artifact = property(lambda self: self._maps.artifact)
+    min_map = property(lambda self: self._maps.min_map)
+    max_map = property(lambda self: self._maps.max_map)
+    motion_map = property(lambda self: self._maps.motion_map)
+    rescued = property(lambda self: self._maps.rescued)
 
     def _build_maps(self):
         """Derive per-pixel band and motion thresholds from surface + noise.
@@ -158,31 +280,59 @@ class PressDetector:
         * ``min_map`` / ``motion_map``: scale with measured per-pixel noise so
           flicker can't press, without killing whole zones.
         """
-        surf = self.surface.astype(np.float32)
+        rescued = self._rescued
+        if rescued is not None:
+            surface = np.where(rescued, self._plane_z, self._measured)
+            artifact = self._raw_artifact & ~rescued
+        else:
+            surface = self._measured
+            artifact = self._raw_artifact
+        surf = surface.astype(np.float32)
         gx = cv2.Sobel(surf, cv2.CV_32F, 1, 0, ksize=3) / 8.0   # mm per pixel
         gy = cv2.Sobel(surf, cv2.CV_32F, 0, 1, ksize=3) / 8.0
         slope = cv2.GaussianBlur(cv2.magnitude(gx, gy), (7, 7), 0)
         # Holes fake huge gradients; don't loosen the ceiling near them.
-        near_hole = cv2.dilate((self.surface <= 0).astype(np.uint8),
+        near_hole = cv2.dilate((self._measured <= 0).astype(np.uint8),
                                np.ones((5, 5), np.uint8)) > 0
         slope[near_hole] = 0.0
+        if rescued is not None:
+            # at the seam measured<->plane the Sobel sees a fake step; use the
+            # plane's own (smooth) slope there instead
+            pz = self._plane_z.astype(np.float32)
+            pgx = cv2.Sobel(pz, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+            pgy = cv2.Sobel(pz, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+            seam = cv2.dilate(rescued.astype(np.uint8),
+                              np.ones((5, 5), np.uint8)) > 0
+            slope[seam] = cv2.magnitude(pgx, pgy)[seam]
 
         # calibrate_touch() may raise contact_max above the static cap — the
         # cap then follows, so a calibrated ceiling is never clipped away
         ceil_cap = max(MAX_BAND_CEIL_MM, self.contact_max + 20)
-        self.max_map = np.clip(self.contact_max + SLOPE_GAIN_PX * slope,
-                               self.contact_max, ceil_cap).astype(np.int32)
+        max_map = np.clip(self.contact_max + SLOPE_GAIN_PX * slope,
+                          self.contact_max, ceil_cap).astype(np.int32)
 
         if self.noise is not None:
             floor = np.maximum(self.contact_min,
                                NOISE_FLOOR_GAIN * self.noise + 5.0)
-            self.min_map = np.clip(floor, self.contact_min,
-                                   NOISE_FLOOR_CAP_MM).astype(np.int32)
-            self.motion_map = np.maximum(self.motion_mm,
-                                         2.5 * self.noise).astype(np.int32)
+            min_map = np.clip(floor, self.contact_min,
+                              NOISE_FLOOR_CAP_MM).astype(np.int32)
+            motion_map = np.maximum(self.motion_mm,
+                                    2.5 * self.noise).astype(np.int32)
         else:
-            self.min_map = np.full(self.surface.shape, self.contact_min, np.int32)
-            self.motion_map = np.full(self.surface.shape, self.motion_mm, np.int32)
+            min_map = np.full(surface.shape, self.contact_min, np.int32)
+            motion_map = np.full(surface.shape, self.motion_mm, np.int32)
+        hole_rescued = self._hole_rescued
+        if rescued is not None:
+            # the plane is rougher than a real measurement: stricter floor, and
+            # the noise measured on garbage readings means nothing there
+            min_map = np.where(rescued, np.maximum(min_map, PLANE_CONTACT_MIN_MM),
+                               min_map).astype(np.int32)
+            max_map = np.where(rescued, np.maximum(max_map, min_map + 15),
+                               max_map).astype(np.int32)
+            motion_map = np.where(rescued, self.motion_mm,
+                                  motion_map).astype(np.int32)
+        self._maps = _Maps(surface.astype(np.int32), artifact, min_map, max_map,
+                           motion_map, rescued, hole_rescued)
 
     def calibrate_artifacts(self, empty_frames):
         """Learn noise + artifacts from frames of the EMPTY scene.
@@ -192,22 +342,93 @@ class PressDetector:
         masked outright. Pixels still reading in-band while empty — systematic
         mismatch — are masked too. Returns the masked fraction.
         """
+        if self.plane_fallback:      # recalibration starts from the raw state
+            self._rescued = self._hole_rescued = self._plane_z = None
+        self._valid_all = None
         if len(empty_frames) >= 3:
             stack = np.stack([f.astype(np.float32) for f in empty_frames])
             valid_all = (stack > 0).all(axis=0)
+            self._valid_all = valid_all
             std = np.std(stack, axis=0)
             self.noise = np.where(valid_all, std, 0.0).astype(np.float32)
-            self.artifact |= valid_all & (std > NOISE_BROKEN_MM)
-            self.artifact |= ~valid_all & (stack > 0).any(axis=0)  # validity flicker
+            self._raw_artifact = self._raw_artifact | (valid_all & (std > NOISE_BROKEN_MM))
+            self._raw_artifact = self._raw_artifact | (~valid_all & (stack > 0).any(axis=0))  # validity flicker
             self._build_maps()  # thresholds now noise-aware
 
-        bad = np.zeros_like(self.artifact)
+        bad = np.zeros_like(self._raw_artifact)
         for f in empty_frames:
             bad |= self._contact_band(f.astype(np.int32))
         if bad.any():
             bad = cv2.dilate(bad.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-        self.artifact |= bad
+        self._raw_artifact = self._raw_artifact | bad
+
+        # nearest valid reading per pixel over the empty frames: a pixel that
+        # ever read well IN FRONT of the plane is in-band garbage, not a hole
+        if empty_frames:
+            st = np.stack([f.astype(np.int32) for f in empty_frames])
+            closest = np.where(st > 0, st, 1 << 30).min(axis=0)
+            self._empty_closest = np.where(closest == 1 << 30, 0, closest)
+        self._calibrated = True
+        if self.plane_fallback:
+            self._update_plane()
+        else:
+            self._build_maps()
         return float(self.artifact.mean())
+
+    # -- plane fallback --------------------------------------------------------
+
+    def _mat_mask_from_labels(self):
+        if self.label_map is None or not (self.label_map >= 0).any():
+            return None
+        k = 2 * MAT_DILATE_PX + 1
+        return cv2.dilate((self.label_map >= 0).astype(np.uint8),
+                          np.ones((k, k), np.uint8)) > 0
+
+    def _update_plane(self):
+        """Fit the plane and decide which unusable pixels it may stand in for.
+
+        A pixel the plane cannot help (or any failure) keeps its old fate, so
+        this can only ever improve on the plain per-pixel reference."""
+        self._mat_mask = mat = self._mat_mask_from_labels()
+        meas, raw = self._measured, self._raw_artifact
+        cand = (meas > 0) & ~raw
+        if mat is not None:
+            cand &= mat
+        if self.noise is not None:
+            cand &= self.noise <= PLANE_FIT_NOISE_MM
+        fit = fit_inverse_depth_plane(meas, cand)
+        if fit is None:
+            self._rescued = self._hole_rescued = self._plane_z = None
+            self.plane_info = {"enabled": True, "ok": False,
+                               "reason": "no convincing plane"}
+            self._build_maps()
+            return
+        plane_z = plane_depth_map(fit["coef"], meas.shape)
+        usable = (meas > 0) & ~raw & (np.abs(meas - plane_z) <= PLANE_TOL_MM)
+        if mat is not None:
+            domain = mat
+        else:   # no tiles yet: the hull of the good pixels (keeps letterbox out)
+            pts = cv2.findNonZero(cand.astype(np.uint8))
+            domain = np.zeros(meas.shape, np.uint8)
+            cv2.fillConvexPoly(domain, cv2.convexHull(pts), 1)
+            domain = domain > 0
+        rescued = domain & ~usable & (plane_z > 0)
+        if self._empty_closest is not None:
+            c = self._empty_closest
+            rescued &= ~((c > 0) & (plane_z - c >= PLANE_CONSIST_MM))
+        valid_all = self._valid_all if self._valid_all is not None else (meas > 0)
+        hole = rescued & ~valid_all
+        self._plane_z = plane_z
+        self._rescued = rescued if rescued.any() else None
+        self._hole_rescued = hole if self._rescued is not None else None
+        area = float(domain.sum())
+        self.plane_info = {
+            "enabled": True, "ok": True, "coef": fit["coef"],
+            "inlier_ratio": fit["inlier_ratio"], "rms_mm": fit["rms_mm"],
+            "n_fit": fit["n_fit"],
+            "rescued_frac": float(rescued.sum()) / max(area, 1.0),
+            "rescued_frame_frac": float(rescued.mean())}
+        self._build_maps()
 
     def calibrate_touch(self, frames, margin_mm=15):
         """Set the contact-band ceiling from the player's own feet.
@@ -225,10 +446,11 @@ class PressDetector:
         foot-sized object was found (state is then unchanged).
         """
         samples = []
+        m = self._maps
         for f in frames:
             d = f.astype(np.int32)
-            above = self.surface - d
-            valid = (d > 0) & (self.surface > 0) & (~self.artifact)
+            above = m.surface - d
+            valid = (d > 0) & (m.surface > 0) & (~m.artifact)
             obj = self._foot_object_mask(above, valid)
             n, lab, stats, _ = cv2.connectedComponentsWithStats(
                 obj.astype(np.uint8), connectivity=8)
@@ -262,6 +484,12 @@ class PressDetector:
         self._tile_area = np.bincount(lab, minlength=len(self.tile_ids)) \
             if lab.size else np.zeros(len(self.tile_ids), np.int64)
         self._reset_runtime()
+        if self._calibrated and self.plane_fallback:
+            mat = self._mat_mask_from_labels()
+            old = self._mat_mask
+            if (mat is None) != (old is None) or (
+                    mat is not None and not np.array_equal(mat, old)):
+                self._update_plane()
 
     def _reset_runtime(self):
         self._prev = None
@@ -274,16 +502,18 @@ class PressDetector:
 
     # -- per-frame ------------------------------------------------------------
 
-    def _contact_band(self, d):
-        above = self.surface - d
-        return ((d > 0) & (self.surface > 0) & (~self.artifact) &
-                (above >= self.min_map) & (above <= self.max_map))
+    def _contact_band(self, d, m=None):
+        m = m or self._maps
+        above = m.surface - d
+        return ((d > 0) & (m.surface > 0) & (~m.artifact) &
+                (above >= m.min_map) & (above <= m.max_map))
 
     def update(self, depth_mm):
         """Feed one aligned depth frame; returns the set of tiles newly pressed."""
         if depth_mm is None or self.label_map is None or not self.tile_ids:
             return set()
         d = depth_mm.astype(np.int32)
+        m = self._maps     # one consistent snapshot for the whole frame
 
         # Motion gate: remember which pixels changed recently (vs their own
         # noise level). On a static scene nothing has motion -> nothing presses.
@@ -294,21 +524,25 @@ class PressDetector:
                         where=self._motion_age > 0)
         if self._prev is not None:
             moved = (d > 0) & (self._prev > 0) & \
-                    (np.abs(d - self._prev) > self.motion_map)
+                    (np.abs(d - self._prev) > m.motion_map)
+            if m.hole_rescued is not None:
+                # over a rescued hole the empty mat read 0: a foot appearing
+                # there goes 0 -> valid, which is movement too
+                moved |= m.hole_rescued & (self._prev == 0) & (d > 0)
             self._motion_age[moved] = self.motion_hold
         self._prev = d
 
         # Band stability: a pixel must STAY in the contact band for consecutive
         # frames. Noise flicker jumps in and out; a resting fingertip doesn't.
-        band = self._contact_band(d)
+        band = self._contact_band(d, m)
         if self._band_age is None:
             self._band_age = np.zeros(d.shape, np.int16)
         self._band_age[~band] = 0
         self._band_age[band] += 1
 
-        above = self.surface - d
-        valid = (d > 0) & (self.surface > 0) & (~self.artifact)
-        hover = valid & (above > self.max_map)
+        above = m.surface - d
+        valid = (d > 0) & (m.surface > 0) & (~m.artifact)
+        hover = valid & (above > m.max_map)
         # Presence: in-band pixels NEAR a hovering mass (the foot standing on
         # the key). No motion gate — a resting foot goes motion-silent but must
         # keep its tile held. No far-away band pixels either: a wrinkle the
@@ -492,10 +726,11 @@ class PressDetector:
         streaming thread while update() runs on the capture thread.
         """
         d = depth_mm.astype(np.int32)
-        above = self.surface - d
-        hover = ((d > 0) & (self.surface > 0) & (~self.artifact) &
-                 (above > self.max_map))
-        band = self._contact_band(d)
+        m = self._maps
+        above = m.surface - d
+        hover = ((d > 0) & (m.surface > 0) & (~m.artifact) &
+                 (above > m.max_map))
+        band = self._contact_band(d, m)
         if self._band_age is not None and self._motion_age is not None:
             contact = band & (self._band_age >= self.band_stable) & \
                       (self._motion_age > 0)
@@ -511,17 +746,22 @@ class PressDetector:
         official viewer. Overlays: yellow = in the contact band, red = pixels
         that can actually fire (band + stable + motion + ring guard), cyan
         outline = hovering object (foot/hand above the band), darkened =
-        masked artifact pixels, near-black = no depth reading.
+        masked artifact pixels, magenta tint = reference from the fitted plane
+        (plane fallback), near-black = no depth reading.
         """
         d = depth_mm.astype(np.float32)
-        valid = (depth_mm > 0) & (self.surface > 0)
-        surf = self.surface[self.surface > 0]
+        m = self._maps
+        valid = (depth_mm > 0) & (m.surface > 0)
+        surf = m.surface[m.surface > 0]
         lo = max(200.0, float(np.percentile(surf, 5)) - 600.0) if surf.size else 400.0
         hi = float(np.percentile(surf, 95)) + 200.0 if surf.size else 3000.0
         norm = np.clip((d - lo) / max(hi - lo, 1.0), 0.0, 1.0)
         img = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
         img[depth_mm == 0] = (15, 15, 15)
-        img[self.artifact & valid] = (img[self.artifact & valid] * 0.35).astype(np.uint8)
+        img[m.artifact & valid] = (img[m.artifact & valid] * 0.35).astype(np.uint8)
+        if m.rescued is not None:   # magenta tint: reference comes from the plane
+            r = m.rescued & valid
+            img[r] = (0.5 * img[r] + 0.5 * np.float32((255, 0, 255))).astype(np.uint8)
         band, contact, hover = self.live_masks(depth_mm)
         if hover.any():   # outline the hovering object, keep its colormap fill
             cnts, _ = cv2.findContours(hover.astype(np.uint8),

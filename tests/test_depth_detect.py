@@ -7,7 +7,8 @@ static artifacts near the surface never fire (artifact mask); a real press
 import numpy as np
 
 from webui.depth_detect import (DepthHitTracker, PressDetector,
-                               build_tile_label_map)
+                               build_tile_label_map, fit_inverse_depth_plane,
+                               plane_depth_map)
 
 W, H = 640, 480
 
@@ -364,3 +365,205 @@ def test_held_key_survives_motion_timeout_and_liftoff_fires_once():
     for _ in range(5):
         again |= det.update(press)
     assert again == {1}
+
+
+# ── plane fallback ───────────────────────────────────────────────────────────
+
+def _tilted(a=0.02, b=-0.27, c=0.77):
+    """A real tilted plane: 1/z linear in the image coordinates (z ~1300-2000)."""
+    u = np.arange(W)[None, :] / W
+    v = np.arange(H)[:, None] / H
+    return np.round(1000.0 / (a * u + b * v + c)).astype(np.uint16)
+
+
+PLANE_TILES = [_tile(1, 50, 50, 250, 250), _tile(2, 300, 50, 500, 250)]
+
+
+def _empty_frames(surface, holes=(), n=8, sigma=2.0, seed=0):
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        f = surface.astype(np.int32) + np.round(
+            rng.normal(0, sigma, surface.shape)).astype(np.int32)
+        for (y0, y1, x0, x1) in holes:
+            f[y0:y1, x0:x1] = 0
+        out.append(np.clip(f, 0, 65535).astype(np.uint16))
+    return out
+
+
+def _calibrated(frames, tiles=PLANE_TILES, **kw):
+    ref = np.median(np.stack(frames), axis=0).astype(np.uint16)
+    det = PressDetector(ref, **kw)
+    det.set_tiles(*build_tile_label_map(tiles, W, H))
+    det.calibrate_artifacts(frames)
+    return det
+
+
+def _foot(surface, y0, y1, x0, x1, mm=30):
+    f = surface.astype(np.int32).copy()
+    f[y0:y1, x0:x1] -= mm
+    f[y0:y1, x1:x1 + 10] -= 300          # the limb above the band
+    return f.astype(np.uint16)
+
+
+def test_plane_fit_recovers_tilted_plane():
+    surf = _tilted()
+    rng = np.random.default_rng(1)
+    noisy = surf.astype(np.int32) + np.round(rng.normal(0, 2, surf.shape)).astype(np.int32)
+    mask = np.zeros(surf.shape, bool)
+    mask[40:260, 40:510] = True
+    fit = fit_inverse_depth_plane(noisy, mask)
+    assert fit is not None and fit["inlier_ratio"] > 0.95 and fit["rms_mm"] < 3
+    err = np.abs(plane_depth_map(fit["coef"], surf.shape).astype(int) - surf.astype(int))
+    assert err[mask].max() <= 3
+    # a linear-in-z fit would be visibly wrong on this tilt (design decision)
+    vv, uu = np.mgrid[0:H, 0:W]
+    A = np.stack([uu[mask] / W, vv[mask] / H, np.ones(mask.sum())], 1)
+    c, *_ = np.linalg.lstsq(A, surf[mask].astype(float), rcond=None)
+    assert np.abs(A @ c - surf[mask]).max() > 10
+
+
+def test_holes_rescued_by_plane():
+    surf = _tilted()
+    holes = [(100, 140, 100, 140)]
+    det = _calibrated(_empty_frames(surf, holes))
+    r = det.rescued
+    assert r is not None and r[110, 110] and not det.artifact[110, 110]
+    assert abs(int(det.surface[110, 110]) - int(surf[110, 110])) <= 3
+    assert det.min_map[110, 110] >= 20
+    assert det.plane_info["ok"] and det.plane_info["rescued_frac"] > 0
+
+
+def test_press_on_rescued_hole_fires_only_with_fallback():
+    surf = _tilted()
+    holes = [(100, 140, 100, 140)]
+    frames = _empty_frames(surf, holes)
+    press = _foot(surf, 105, 135, 105, 135)
+    for fallback, expected in ((True, {1}), (False, set())):
+        det = _calibrated(frames, plane_fallback=fallback)
+        det.update(frames[0])
+        det.update(frames[1])
+        fired = set()
+        for _ in range(6):
+            fired |= det.update(press)
+        assert fired == expected, fallback
+
+
+def test_inband_garbage_flicker_stays_masked():
+    surf = _tilted()
+    rng = np.random.default_rng(3)
+    frames = _empty_frames(surf)
+    for f in frames:                       # reflection: 0 or 25 mm "in front"
+        blk = f[150:190, 350:390].astype(np.int32)
+        f[150:190, 350:390] = np.where(rng.random((40, 40)) < 0.5, 0, blk - 25)
+    det = _calibrated(frames)
+    assert det.artifact[170, 370]
+    fired = set()
+    det.update(frames[0])
+    for i in range(12):
+        fired |= det.update(frames[i % len(frames)])
+    assert fired == set()
+
+
+def test_reflection_reading_behind_plane_is_rescued():
+    surf = _tilted()
+    rng = np.random.default_rng(4)
+    frames = _empty_frames(surf)
+    for f in frames:                       # multipath: far too deep, noisy
+        f[150:190, 350:390] = (surf[150:190, 350:390].astype(np.int32)
+                               + 80 + rng.integers(0, 120, (40, 40))).astype(np.uint16)
+    det = _calibrated(frames)
+    assert det.rescued is not None and det.rescued[170, 370]
+    assert abs(int(det.surface[170, 370]) - int(surf[170, 370])) <= 3
+
+
+def test_live_zero_stays_blind():
+    surf = _tilted()
+    holes = [(100, 140, 100, 140)]
+    frames = _empty_frames(surf, holes)
+    det = _calibrated(frames)
+    press = _foot(surf, 105, 135, 105, 135)
+    press[105:135, 105:135] = 0            # sensor still blind while foot is down
+    det.update(frames[0])
+    fired = set()
+    for _ in range(6):
+        fired |= det.update(press)
+    assert fired == set()
+
+
+def test_reliable_bump_keeps_measured_surface():
+    surf = _tilted().astype(np.int32)
+    surf[120:160, 120:160] -= 25           # real, stable 25 mm bump in the mat
+    surf = surf.astype(np.uint16)
+    det = _calibrated(_empty_frames(surf, sigma=1.0))
+    assert int(det.surface[140, 140]) == int(surf[140, 140]) or \
+        abs(int(det.surface[140, 140]) - int(surf[140, 140])) <= 2
+    press = _foot(surf, 125, 155, 125, 155)
+    det.update(surf)
+    fired = set()
+    for _ in range(6):
+        fired |= det.update(press)
+    assert fired == {1}
+
+
+def test_plane_fit_failure_falls_back_to_old_behaviour():
+    surf = _flat(1000).copy()
+    surf[:, 320:] = 1400                   # two-level step: no single plane
+    frames = _empty_frames(surf, [(100, 140, 100, 140)])
+    on = _calibrated(frames, tiles=[_tile(1, 0, 0, 640, 480)])
+    off = _calibrated(frames, tiles=[_tile(1, 0, 0, 640, 480)], plane_fallback=False)
+    assert not on.plane_info["ok"]
+    for name in ("surface", "artifact", "min_map", "max_map", "motion_map"):
+        assert np.array_equal(getattr(on, name), getattr(off, name)), name
+
+
+def test_switch_off_is_identical_to_pre_feature_golden():
+    """Hash recorded on the commit BEFORE the feature (scenario: tilted plane,
+    holes + reflection flicker, one press)."""
+    import hashlib
+    rng = np.random.default_rng(0)
+    surf = _tilted()
+    frames = []
+    for _ in range(8):
+        f = surf.astype(np.int32) + np.round(rng.normal(0, 2, surf.shape)).astype(np.int32)
+        f[100:140, 100:140] = 0
+        f[150:190, 350:390] = np.where(rng.random((40, 40)) < .5, 0,
+                                       f[150:190, 350:390] - 25)
+        frames.append(np.clip(f, 0, 65535).astype(np.uint16))
+    ref = np.median(np.stack(frames), axis=0).astype(np.uint16)
+    det = PressDetector(ref, plane_fallback=False)
+    det.set_tiles(*build_tile_label_map(PLANE_TILES, W, H))
+    det.calibrate_artifacts(frames)
+    press = surf.astype(np.int32).copy()
+    press[200:240, 310:350] -= 20
+    press[200:240, 350:360] -= 300
+    press = press.astype(np.uint16)
+    fired = [sorted(det.update(d)) for d in [frames[0]] * 3 + [press] * 6 + [frames[1]] * 6]
+    h = hashlib.sha256()
+    for a in (det.artifact, det.min_map, det.max_map, det.motion_map,
+              det.render_debug(press)):
+        h.update(np.ascontiguousarray(a).tobytes())
+    h.update(repr(fired).encode())
+    assert h.hexdigest() == "e9d944a13c1b753a9fec8de0d989b758a35aafee1e28c6b997c4dafd323c23ef"
+
+
+def test_set_tiles_after_calibration_restricts_rescue():
+    surf = _tilted()
+    frames = _empty_frames(surf, [(100, 140, 100, 140), (400, 440, 560, 600)])
+    ref = np.median(np.stack(frames), axis=0).astype(np.uint16)
+    det = PressDetector(ref)
+    det.calibrate_artifacts(frames)           # no tiles yet: hull domain
+    before = det._maps
+    det.set_tiles(*build_tile_label_map(PLANE_TILES, W, H))
+    assert det._maps is not before            # swapped, not mutated
+    assert det.rescued is not None and det.rescued[110, 110]
+    assert not det.rescued[420, 580]          # outside the mat now
+
+
+def test_render_debug_tints_rescued_magenta():
+    surf = _tilted()
+    det = _calibrated(_empty_frames(surf, [(100, 140, 100, 140)]))
+    live = surf.copy()
+    img = det.render_debug(live)
+    px = img[110, 110].astype(int)            # B, G, R
+    assert px[2] > px[1] and px[0] > px[1]

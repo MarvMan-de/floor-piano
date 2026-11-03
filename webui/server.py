@@ -267,15 +267,27 @@ async def capture_surface() -> JSONResponse:
         raise HTTPException(status_code=503,
                             detail="No depth frames — is the Orbbec connected and streaming?")
     surface = np.median(np.stack(grabbed), axis=0).astype(np.uint16)
-    _detector = PressDetector(surface)
+    det = PressDetector(surface)
+    _detector = det
+    _rebuild_label_map()   # tiles first: the plane fit is restricted to the mat
     extra = await _grab_depth_frames(8, loop)
     # All empty frames feed the artifact calibration: in-band mismatches AND
-    # temporally unstable (flickering) pixels get masked out.
-    artifact_frac = _detector.calibrate_artifacts(grabbed + extra)
+    # temporally unstable (flickering) pixels get masked out — unless the
+    # fitted mat plane can stand in for them (plane fallback). The RANSAC fit
+    # is CPU work: keep it off the event loop.
+    artifact_frac = await loop.run_in_executor(
+        None, det.calibrate_artifacts, grabbed + extra)
     _rebuild_label_map()
     valid = float((surface > 0).mean())
+    info = det.plane_info
+    plane = {"enabled": bool(info.get("enabled")), "ok": bool(info.get("ok"))}
+    if info.get("ok"):
+        plane.update(rescued_frac=round(info["rescued_frac"], 3),
+                     inlier_ratio=round(info["inlier_ratio"], 3),
+                     rms_mm=round(info["rms_mm"], 2))
     return JSONResponse({"ok": True, "valid_frac": round(valid, 2),
-                         "artifact_frac": round(artifact_frac, 3)})
+                         "artifact_frac": round(artifact_frac, 3),
+                         "plane": plane})
 
 
 @app.post("/api/capture_feet")

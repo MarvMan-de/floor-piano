@@ -421,7 +421,9 @@ async function captureSurface() {
     const data = await res.json();
     state.surfaceReady = true;
     updateSteps();
-    setStatus(`Oberfläche erfasst (${Math.round((data.valid_frac || 0) * 100)}% gültig) `
+    const rescued = data.plane && data.plane.ok && data.plane.rescued_frac > 0
+      ? ` · ${Math.round(data.plane.rescued_frac * 100)}% per Ebene ergänzt` : "";
+    setStatus(`Oberfläche erfasst (${Math.round((data.valid_frac || 0) * 100)}% gültig${rescued}) `
               + "— jetzt Tasten drücken", "ok");
   } catch (err) {
     setStatus("Oberfläche erfassen fehlgeschlagen: " + err.message, "err");
